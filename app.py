@@ -1,14 +1,20 @@
-from flask import Flask, request, render_template_string
-from datetime import date, timedelta
+from flask import Flask, request, render_template_string, redirect, url_for, Response
+from datetime import date, timedelta, datetime
 import sqlite3
-import json
 from pathlib import Path
+import os
+import csv
+import io
 
 app = Flask(__name__)
 
 # ---------------- CONFIG ----------------
 WEEKLY_GOAL = 100
 DB_PATH = Path("sales.db")
+
+# Edit this list to match your team:
+REPS = ["Tristan", "Ricky", "Sohaib"]
+DEFAULT_REP = REPS[0] if REPS else "Rep"
 # ---------------------------------------
 
 _db_ready = False
@@ -25,13 +31,18 @@ def db_conn():
 
 def init_db():
     with db_conn() as conn:
+        # Entries table = every Add is one saved log row
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS weekly_sales (
-                week_start TEXT PRIMARY KEY,
-                total INTEGER NOT NULL DEFAULT 0,
-                history_json TEXT NOT NULL DEFAULT '[]'
+            CREATE TABLE IF NOT EXISTS sales_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                week_start TEXT NOT NULL,
+                rep TEXT NOT NULL,
+                qty INTEGER NOT NULL,
+                created_at TEXT NOT NULL
             )
         """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week ON sales_entries(week_start)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week_rep ON sales_entries(week_start, rep)")
         conn.commit()
 
 
@@ -47,53 +58,87 @@ def week_label(week_start: date) -> str:
     return f"{fmt(week_start)}–{fmt(week_end)}"
 
 
-def load_week(week_start: date):
-    init_db()
+def clamp(n, lo, hi):
+    return max(lo, min(hi, n))
+
+
+def now_iso():
+    # Keep it simple + consistent; store UTC-ish ISO without TZ
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def week_total(week_start: date) -> int:
     with db_conn() as conn:
         row = conn.execute(
-            "SELECT total, history_json FROM weekly_sales WHERE week_start = ?",
+            "SELECT COALESCE(SUM(qty), 0) AS total FROM sales_entries WHERE week_start = ?",
             (week_start.isoformat(),)
         ).fetchone()
-
-        if row is None:
-            conn.execute(
-                "INSERT INTO weekly_sales (week_start, total, history_json) VALUES (?, 0, '[]')",
-                (week_start.isoformat(),)
-            )
-            conn.commit()
-            return 0, []
-
-        total = int(row["total"])
-        try:
-            history = json.loads(row["history_json"] or "[]")
-            if not isinstance(history, list):
-                history = []
-        except Exception:
-            history = []
-
-        cleaned = []
-        for x in history:
-            try:
-                cleaned.append(int(x))
-            except Exception:
-                pass
-
-        return total, cleaned
+        return int(row["total"] or 0)
 
 
-def save_week(week_start: date, total: int, history: list[int]):
-    init_db()
+def rep_totals(week_start: date):
+    with db_conn() as conn:
+        rows = conn.execute(
+            "SELECT rep, COALESCE(SUM(qty), 0) AS total "
+            "FROM sales_entries WHERE week_start = ? "
+            "GROUP BY rep ORDER BY total DESC, rep ASC",
+            (week_start.isoformat(),)
+        ).fetchall()
+        return [(r["rep"], int(r["total"])) for r in rows]
+
+
+def recent_entries(week_start: date, limit: int = 10):
+    with db_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, rep, qty, created_at FROM sales_entries "
+            "WHERE week_start = ? "
+            "ORDER BY id DESC LIMIT ?",
+            (week_start.isoformat(), limit)
+        ).fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "id": int(r["id"]),
+                "rep": r["rep"],
+                "qty": int(r["qty"]),
+                "created_at": r["created_at"],
+            })
+        return out
+
+
+def add_entry(week_start: date, rep: str, qty: int):
+    qty = int(qty)
+    if qty <= 0:
+        raise ValueError("qty must be positive")
+    rep = (rep or "").strip() or DEFAULT_REP
     with db_conn() as conn:
         conn.execute(
-            "INSERT INTO weekly_sales (week_start, total, history_json) VALUES (?, ?, ?) "
-            "ON CONFLICT(week_start) DO UPDATE SET total=excluded.total, history_json=excluded.history_json",
-            (week_start.isoformat(), int(total), json.dumps(history))
+            "INSERT INTO sales_entries (week_start, rep, qty, created_at) VALUES (?, ?, ?, ?)",
+            (week_start.isoformat(), rep, qty, now_iso())
         )
         conn.commit()
 
 
-def clamp(n, lo, hi):
-    return max(lo, min(hi, n))
+def undo_last_entry(week_start: date):
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT id, rep, qty FROM sales_entries WHERE week_start = ? ORDER BY id DESC LIMIT 1",
+            (week_start.isoformat(),)
+        ).fetchone()
+        if row is None:
+            return None
+        entry_id = int(row["id"])
+        rep = row["rep"]
+        qty = int(row["qty"])
+        conn.execute("DELETE FROM sales_entries WHERE id = ?", (entry_id,))
+        conn.commit()
+        return {"id": entry_id, "rep": rep, "qty": qty}
+
+
+def reset_week(week_start: date):
+    with db_conn() as conn:
+        conn.execute("DELETE FROM sales_entries WHERE week_start = ?", (week_start.isoformat(),))
+        conn.commit()
 
 
 @app.before_request
@@ -227,21 +272,25 @@ HTML_PAGE = """
       gap:10px;
       align-items:center;
     }
-    input{
+
+    input, select{
       padding: 10px 12px;
-      width: 180px;
       border-radius: 12px;
       border: 1px solid rgba(15,23,42,.18);
       outline: none;
       font-size: 14px;
       background: rgba(255,255,255,.96);
-      font-weight: 700;
+      font-weight: 750;
     }
-    input:focus{
+    input{ width: 160px; }
+    select{ width: 200px; }
+
+    input:focus, select:focus{
       box-shadow: 0 0 0 4px rgba(37,99,235,.18);
       border-color: rgba(37,99,235,.55);
     }
-    button{
+
+    button, a.btn{
       padding: 10px 12px;
       border-radius: 12px;
       border: 1px solid rgba(15,23,42,.14);
@@ -250,8 +299,15 @@ HTML_PAGE = """
       font-weight: 950;
       font-size: 14px;
       transition: transform .08s ease;
+      text-decoration:none;
+      color: inherit;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      gap:8px;
     }
-    button:hover{ transform: translateY(-1px); }
+    button:hover, a.btn:hover{ transform: translateY(-1px); }
+
     .btn-primary{
       background: linear-gradient(180deg, rgba(37,99,235,.95), rgba(29,78,216,.95));
       color: white;
@@ -286,6 +342,38 @@ HTML_PAGE = """
       filter: drop-shadow(0 12px 16px rgba(0,0,0,.16));
       user-select:none;
     }
+
+    .split{
+      display:grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    @media (min-width: 650px){
+      .split{ grid-template-columns: 1fr 1fr; }
+    }
+
+    .table{
+      width:100%;
+      border-collapse: collapse;
+      overflow:hidden;
+      border-radius: 14px;
+      border: 1px solid rgba(15,23,42,.10);
+      background: rgba(255,255,255,.72);
+    }
+    .table th, .table td{
+      padding: 10px 10px;
+      font-size: 13px;
+      text-align:left;
+      border-bottom: 1px solid rgba(15,23,42,.08);
+    }
+    .table th{
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: rgba(15,23,42,.65);
+    }
+    .muted{ color: rgba(15,23,42,.62); font-weight: 700; }
   </style>
 </head>
 <body>
@@ -301,14 +389,16 @@ HTML_PAGE = """
 
       <div class="meta">
         <div class="pill">Week: <b>{{ range_label }}</b></div>
-        <div class="pill">Today: <b>{{ today }}</b></div>
+        <div class="pill">Total: <b>{{ weekly_sales }}</b></div>
         <div class="pill">Goal: <b>{{ goal }}</b></div>
       </div>
     </div>
 
     <div class="grid">
+      <!-- LEFT: Jug -->
       <div class="card">
         <div class="jugWrap">
+          <!-- Jug SVG (unchanged from your current good version) -->
           <svg class="jugSvg" viewBox="0 0 280 420" role="img" aria-label="Jug fill shows weekly progress">
             <defs>
               <clipPath id="jugClip">
@@ -359,7 +449,6 @@ HTML_PAGE = """
                 <stop offset="1" stop-color="rgba(30,64,175,0.98)"/>
               </linearGradient>
 
-              <!-- Plastic sheen overlay -->
               <linearGradient id="sheen" x1="0" x2="1">
                 <stop offset="0" stop-color="rgba(255,255,255,0.10)"/>
                 <stop offset="0.35" stop-color="rgba(255,255,255,0.03)"/>
@@ -367,11 +456,9 @@ HTML_PAGE = """
                 <stop offset="1" stop-color="rgba(255,255,255,0.08)"/>
               </linearGradient>
 
-              <!-- Text paths -->
               <path id="primoArc" d="M86 198 C122 190 158 190 194 198" />
               <path id="waterArc" d="M98 220 C128 216 152 216 182 220" />
 
-              <!-- Very soft text filter so it feels under plastic -->
               <filter id="textUnderPlastic" x="-20%" y="-20%" width="140%" height="140%">
                 <feGaussianBlur in="SourceGraphic" stdDeviation="0.12" result="soft"/>
                 <feMerge>
@@ -381,7 +468,6 @@ HTML_PAGE = """
               </filter>
             </defs>
 
-            <!-- WATER -->
             <g clip-path="url(#jugClip)">
               <rect x="0" y="{{ water_y }}" width="280" height="{{ water_h }}" fill="url(#waterGrad)"/>
               <rect x="0" y="{{ water_y }}" width="280" height="24" fill="url(#waterEdge)" opacity="0.8"/>
@@ -390,7 +476,6 @@ HTML_PAGE = """
               {% endif %}
             </g>
 
-            <!-- JUG BODY -->
             <path d="
               M112 46
               C112 36 168 36 168 46
@@ -413,12 +498,10 @@ HTML_PAGE = """
               Z
             " fill="url(#plastic)" stroke="rgba(255,255,255,0.20)" stroke-width="2"/>
 
-            <!-- Plastic sheen overlay across jug (helps blend label on empty + filled) -->
             <g clip-path="url(#jugClip)">
               <rect x="0" y="0" width="280" height="420" fill="url(#sheen)" opacity="0.60"/>
             </g>
 
-            <!-- Inner thickness -->
             <path d="
               M118 52
               C118 46 162 46 162 52
@@ -441,7 +524,6 @@ HTML_PAGE = """
               Z
             " fill="none" stroke="rgba(15,23,42,0.10)" stroke-width="2"/>
 
-            <!-- Subtle ridges -->
             <path d="M80 150 C114 142 166 142 200 150" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="11" opacity="0.35"/>
             <path d="M78 154 C114 146 166 146 202 154" fill="none" stroke="rgba(0,0,0,0.04)" stroke-width="3" opacity="0.33"/>
             <path d="M80 232 C114 228 166 228 202 232" fill="none" stroke="rgba(255,255,255,0.10)" stroke-width="10" opacity="0.28"/>
@@ -449,7 +531,6 @@ HTML_PAGE = """
             <path d="M88 338 C116 336 164 336 192 338" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="12" opacity="0.38"/>
             <path d="M86 344 C116 342 164 342 194 344" fill="none" stroke="rgba(0,0,0,0.04)" stroke-width="4" opacity="0.36"/>
 
-            <!-- PRIMO/WATER ONLY (no band behind it) -->
             <g opacity="0.86" filter="url(#textUnderPlastic)">
               <circle cx="96" cy="210" r="11" fill="none" stroke="rgba(37,99,235,0.38)" stroke-width="3" opacity="0.78"/>
               <text font-size="21" font-weight="900"
@@ -464,16 +545,13 @@ HTML_PAGE = """
                     style="letter-spacing:0.8px;">
                 <textPath href="#waterArc" startOffset="50%" text-anchor="middle">WATER</textPath>
               </text>
-              <!-- tiny highlight line to imply printing under plastic -->
               <path d="M86 206 C120 196 160 196 194 206" fill="none" stroke="rgba(255,255,255,0.10)" stroke-width="2" opacity="0.55"/>
             </g>
 
-            <!-- Reflections -->
             <rect x="96" y="86" width="10" height="290" rx="5" fill="rgba(255,255,255,0.12)" opacity="0.52"/>
             <rect x="112" y="84" width="5" height="300" rx="2.5" fill="rgba(255,255,255,0.08)" opacity="0.52"/>
             <rect x="174" y="94" width="7" height="276" rx="3.5" fill="rgba(255,255,255,0.07)" opacity="0.52"/>
 
-            <!-- BLUE CAP -->
             <g>
               <rect x="106" y="8" width="68" height="36" rx="12" fill="url(#capBlue)" stroke="rgba(0,0,0,0.12)" />
               <rect x="100" y="5" width="80" height="14" rx="7" fill="rgba(96,165,250,0.95)" stroke="rgba(0,0,0,0.10)"/>
@@ -481,7 +559,6 @@ HTML_PAGE = """
               <rect x="114" y="12" width="12" height="30" rx="6" fill="rgba(255,255,255,0.18)" opacity="0.85"/>
             </g>
 
-            <!-- Neck ring -->
             <rect x="116" y="62" width="48" height="5" rx="2.5" fill="rgba(255,255,255,0.12)" opacity="0.55"/>
           </svg>
 
@@ -493,6 +570,7 @@ HTML_PAGE = """
         </div>
       </div>
 
+      <!-- RIGHT: KPIs + Controls + Reports -->
       <div class="card">
         <div class="kpis">
           <div class="kpi">
@@ -513,12 +591,64 @@ HTML_PAGE = """
         </div>
 
         <form method="POST" id="salesForm" autocomplete="off">
-          <input type="number" id="salesInput" name="sales" placeholder="Add sales" min="0" step="1">
+          <select name="rep" id="repSelect">
+            {% for r in reps %}
+              <option value="{{ r }}" {% if r == selected_rep %}selected{% endif %}>{{ r }}</option>
+            {% endfor %}
+          </select>
+
+          <input type="number" id="salesInput" name="sales" placeholder="Add sales" min="1" step="1">
+
           <button type="submit" name="action" value="add" class="btn-primary">Add</button>
           <button type="submit" name="action" value="undo">Undo</button>
           <button type="submit" name="action" value="reset" class="btn-danger"
                   onclick="return confirm('Reset this week\\'s total to 0?');">Reset</button>
+
+          <a class="btn" href="{{ url_for('export_csv') }}">Export CSV</a>
         </form>
+
+        <div class="split">
+          <div>
+            <div class="muted" style="margin:4px 0 8px;">Leaderboard</div>
+            <table class="table">
+              <thead>
+                <tr><th>Rep</th><th>Total</th></tr>
+              </thead>
+              <tbody>
+                {% if rep_rows %}
+                  {% for rep, total in rep_rows %}
+                    <tr><td>{{ rep }}</td><td><b>{{ total }}</b></td></tr>
+                  {% endfor %}
+                {% else %}
+                  <tr><td colspan="2" class="muted">No entries yet</td></tr>
+                {% endif %}
+              </tbody>
+            </table>
+          </div>
+
+          <div>
+            <div class="muted" style="margin:4px 0 8px;">Recent Activity</div>
+            <table class="table">
+              <thead>
+                <tr><th>Rep</th><th>Qty</th><th>Time</th></tr>
+              </thead>
+              <tbody>
+                {% if recent %}
+                  {% for e in recent %}
+                    <tr>
+                      <td>{{ e.rep }}</td>
+                      <td><b>+{{ e.qty }}</b></td>
+                      <td class="muted">{{ e.created_at }}</td>
+                    </tr>
+                  {% endfor %}
+                {% else %}
+                  <tr><td colspan="3" class="muted">No entries yet</td></tr>
+                {% endif %}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
       </div>
     </div>
   </div>
@@ -527,12 +657,17 @@ HTML_PAGE = """
   (function(){
     const form = document.getElementById('salesForm');
     const input = document.getElementById('salesInput');
+
+    // Only require the number for Add (Undo/Reset/Export don't need it)
     form.addEventListener('click', (e) => {
       const btn = e.target.closest('button');
       if (!btn) return;
       input.required = (btn.value === 'add');
       if (btn.value === 'add') input.focus();
     });
+
+    // Default: not required until they click Add
+    input.required = false;
   })();
   </script>
 </body>
@@ -544,25 +679,23 @@ HTML_PAGE = """
 def index():
     today = date.today()
     wk_start = get_week_start(today)
-    weekly_sales, history = load_week(wk_start)
 
     message = None
     ok = True
 
     if request.method == "POST":
         action = request.form.get("action", "add")
+        selected_rep = (request.form.get("rep") or DEFAULT_REP).strip() or DEFAULT_REP
 
         if action == "reset":
-            weekly_sales = 0
-            history = []
-            message = "Reset complete. Weekly sales cleared."
+            reset_week(wk_start)
+            message = "Reset complete. Weekly entries cleared."
             ok = True
 
         elif action == "undo":
-            if history:
-                last = int(history.pop())
-                weekly_sales = max(0, int(weekly_sales) - last)
-                message = f"Undid last add: -{last}."
+            undone = undo_last_entry(wk_start)
+            if undone:
+                message = f"Undid last entry: {undone['rep']} -{undone['qty']}."
                 ok = True
             else:
                 message = "Nothing to undo yet."
@@ -571,34 +704,36 @@ def index():
         else:  # add
             raw = (request.form.get("sales") or "").strip()
             try:
-                if raw == "":
-                    raise ValueError("empty")
-                added = int(raw)
-                if added < 0:
-                    raise ValueError("negative")
-                if added == 0:
-                    message = "Added 0. No changes made."
-                    ok = False
-                else:
-                    weekly_sales = int(weekly_sales) + added
-                    history.append(added)
-                    message = f"Added {added} sale(s)."
-                    ok = True
+                qty = int(raw)
+                if qty <= 0:
+                    raise ValueError("qty must be positive")
+                add_entry(wk_start, selected_rep, qty)
+                message = f"Added {qty} sale(s) for {selected_rep}."
+                ok = True
             except Exception:
-                message = "For Add: enter a valid non-negative whole number."
+                message = "For Add: enter a valid whole number greater than 0."
                 ok = False
 
-        save_week(wk_start, int(weekly_sales), history)
+        return redirect(url_for("index", msg=message, ok=("1" if ok else "0"), rep=selected_rep))
 
+    # Load view data
+    weekly_sales = week_total(wk_start)
     fill_percentage = clamp((weekly_sales / WEEKLY_GOAL) * 100 if WEEKLY_GOAL else 0, 0, 100)
     remaining = max(0, WEEKLY_GOAL - weekly_sales)
 
-    # Water fills the whole interior INCLUDING the thick short neck.
+    # Water fills including neck (same mapping you had)
     top_y = 46
     bottom_y = 380
     usable_h = bottom_y - top_y
     water_h = int((fill_percentage / 100.0) * usable_h)
     water_y = bottom_y - water_h
+
+    selected_rep = request.args.get("rep") or DEFAULT_REP
+    message = request.args.get("msg")
+    ok = (request.args.get("ok", "1") == "1")
+
+    rep_rows = rep_totals(wk_start)
+    recent = recent_entries(wk_start, limit=10)
 
     return render_template_string(
         HTML_PAGE,
@@ -606,15 +741,48 @@ def index():
         goal=WEEKLY_GOAL,
         fill_percentage=fill_percentage,
         remaining=remaining,
-        message=message,
-        ok=ok,
-        today=today.isoformat(),
-        range_label=week_label(wk_start),
         water_h=water_h,
         water_y=water_y,
+        today=today.isoformat(),
+        range_label=week_label(wk_start),
+        message=message,
+        ok=ok,
+        reps=REPS,
+        selected_rep=selected_rep,
+        rep_rows=rep_rows,
+        recent=recent,
+    )
+
+
+@app.route("/export.csv")
+def export_csv():
+    today = date.today()
+    wk_start = get_week_start(today)
+
+    with db_conn() as conn:
+        rows = conn.execute(
+            "SELECT week_start, rep, qty, created_at FROM sales_entries "
+            "WHERE week_start = ? ORDER BY id ASC",
+            (wk_start.isoformat(),)
+        ).fetchall()
+
+    output = io.StringIO()
+    w = csv.writer(output)
+    w.writerow(["week_start", "rep", "qty", "created_at"])
+    for r in rows:
+        w.writerow([r["week_start"], r["rep"], r["qty"], r["created_at"]])
+
+    csv_bytes = output.getvalue().encode("utf-8")
+
+    filename = f"primo_sales_{wk_start.isoformat()}.csv"
+    return Response(
+        csv_bytes,
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
 
 if __name__ == "__main__":
     init_db()
-    app.run(host="0.0.0.0", port=10000)
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
