@@ -15,6 +15,7 @@ DB_PATH = Path("sales.db")
 # Edit this list to match your team:
 REPS = ["Tristan", "Ricky", "Sohaib"]
 DEFAULT_REP = REPS[0] if REPS else "Rep"
+APP_VERSION = "V.03"
 # ---------------------------------------
 
 _db_ready = False
@@ -31,7 +32,6 @@ def db_conn():
 
 def init_db():
     with db_conn() as conn:
-        # Entries table = every Add is one saved log row
         conn.execute("""
             CREATE TABLE IF NOT EXISTS sales_entries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,7 +63,6 @@ def clamp(n, lo, hi):
 
 
 def now_iso():
-    # Keep it simple + consistent; store UTC-ish ISO without TZ
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
@@ -162,7 +161,7 @@ HTML_PAGE = """
       --bg2:#cfefff;
       --text:#0f172a;
       --muted:#475569;
-      --card:rgba(255,255,255,.84);
+      --card:rgba(255,255,255,.86);
       --border:rgba(255,255,255,.72);
       --shadow:0 16px 40px rgba(0,0,0,.14);
       --primary:#2563eb;
@@ -174,7 +173,7 @@ HTML_PAGE = """
       font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
       color:var(--text);
       margin:0;
-      padding:12px 12px 16px;
+      padding: 12px;
       background: radial-gradient(circle at 18% 12%, #f7feff 0%, var(--bg1) 38%, var(--bg2) 100%);
     }
 
@@ -182,17 +181,19 @@ HTML_PAGE = """
 
     .topbar{
       display:flex;
+      flex-wrap:wrap;
       align-items:center;
       justify-content:space-between;
-      gap:12px;
+      gap:10px;
       padding:12px 14px;
       border-radius:16px;
-      background: rgba(255,255,255,.82);
+      background: rgba(255,255,255,.85);
       border: 1px solid var(--border);
       box-shadow: var(--shadow);
       backdrop-filter: blur(10px);
     }
-    .brand{ display:flex; align-items:center; gap:10px; min-width: 210px; }
+
+    .brand{ display:flex; align-items:center; gap:10px; min-width: 220px; }
     .logo{
       width:34px; height:34px; border-radius:12px;
       background: linear-gradient(135deg, var(--primary) 0%, #06b6d4 100%);
@@ -206,11 +207,12 @@ HTML_PAGE = """
     .meta{ display:flex; flex-wrap:wrap; gap:8px; justify-content:flex-end; align-items:center; }
     .pill{
       display:inline-flex; align-items:center; gap:8px;
-      padding:7px 9px; border-radius:999px;
+      padding:7px 10px; border-radius:999px;
       background: rgba(15,23,42,.06);
       border: 1px solid rgba(15,23,42,.08);
       color: rgba(15,23,42,.82);
-      font-size: 11px; white-space: nowrap;
+      font-size: 11px;
+      white-space: nowrap;
     }
     .pill b{ font-weight: 950; }
 
@@ -234,16 +236,17 @@ HTML_PAGE = """
       padding: 14px;
     }
 
-    .kpis{ display:grid; grid-template-columns:1fr; gap:10px; }
+    .kpis{ display:grid; grid-template-columns: 1fr; gap:10px; }
     @media (min-width: 650px){ .kpis{ grid-template-columns: 1fr 1fr 1fr; } }
 
     .kpi{
       padding: 12px;
       border-radius: 16px;
-      background: rgba(255,255,255,.78);
+      background: rgba(255,255,255,.82);
       border: 1px solid rgba(255,255,255,.78);
       box-shadow: 0 10px 18px rgba(0,0,0,.08);
       text-align:left;
+      min-width: 0;
     }
     .kpi .label{ font-size:11px; color: var(--muted); margin-bottom:6px; font-weight:900; }
     .kpi .value{ font-size:20px; font-weight:950; margin:0; }
@@ -265,6 +268,17 @@ HTML_PAGE = """
       transition: width 650ms cubic-bezier(.2,.9,.2,1);
     }
 
+    .jugWrap{ display:flex; flex-direction:column; align-items:center; gap:8px; }
+    .jugSvg{
+      width: min(360px, 100%);
+      height: auto;
+      filter: drop-shadow(0 12px 16px rgba(0,0,0,.16));
+      user-select:none;
+    }
+    @media (max-width: 480px){
+      .jugSvg{ width: min(320px, 100%); }
+    }
+
     form{
       margin-top: 12px;
       display:flex;
@@ -274,16 +288,17 @@ HTML_PAGE = """
     }
 
     input, select{
-      padding: 10px 12px;
+      padding: 11px 12px;
       border-radius: 12px;
       border: 1px solid rgba(15,23,42,.18);
       outline: none;
       font-size: 14px;
-      background: rgba(255,255,255,.96);
+      background: rgba(255,255,255,.98);
       font-weight: 750;
+      min-width: 0;
     }
     input{ width: 160px; }
-    select{ width: 200px; }
+    select{ width: 210px; }
 
     input:focus, select:focus{
       box-shadow: 0 0 0 4px rgba(37,99,235,.18);
@@ -291,7 +306,7 @@ HTML_PAGE = """
     }
 
     button, a.btn{
-      padding: 10px 12px;
+      padding: 11px 12px;
       border-radius: 12px;
       border: 1px solid rgba(15,23,42,.14);
       background: rgba(255,255,255,.96);
@@ -305,6 +320,7 @@ HTML_PAGE = """
       align-items:center;
       justify-content:center;
       gap:8px;
+      min-width: 92px;
     }
     button:hover, a.btn:hover{ transform: translateY(-1px); }
 
@@ -318,6 +334,23 @@ HTML_PAGE = """
       background: rgba(239,68,68,.12);
       border-color: rgba(239,68,68,.25);
       color: rgba(127,29,29,.95);
+    }
+
+    /* Mobile form: stack cleanly and go full width */
+    @media (max-width: 640px){
+      form{
+        display:grid;
+        grid-template-columns: 1fr 1fr;
+        gap:10px;
+        align-items:stretch;
+      }
+      select{ width: 100%; grid-column: 1 / -1; }
+      input{ width: 100%; grid-column: 1 / -1; }
+      button, a.btn{
+        width: 100%;
+        min-width: 0;
+      }
+      .btn-primary{ grid-column: 1 / -1; }
     }
 
     .flash{
@@ -334,15 +367,6 @@ HTML_PAGE = """
     .flash.ok{ border-color: rgba(34,197,94,.25); background: rgba(34,197,94,.10); }
     .flash.bad{ border-color: rgba(239,68,68,.28); background: rgba(239,68,68,.10); }
 
-    .jugWrap{ display:flex; flex-direction:column; align-items:center; gap:8px; }
-
-    .jugSvg{
-      width: min(370px, 100%);
-      height: auto;
-      filter: drop-shadow(0 12px 16px rgba(0,0,0,.16));
-      user-select:none;
-    }
-
     .split{
       display:grid;
       grid-template-columns: 1fr;
@@ -353,19 +377,26 @@ HTML_PAGE = """
       .split{ grid-template-columns: 1fr 1fr; }
     }
 
-    .table{
-      width:100%;
-      border-collapse: collapse;
-      overflow:hidden;
+    .muted{ color: rgba(15,23,42,.62); font-weight: 700; }
+
+    .tableWrap{
+      width: 100%;
+      overflow-x: auto;
       border-radius: 14px;
       border: 1px solid rgba(15,23,42,.10);
       background: rgba(255,255,255,.72);
+    }
+    .table{
+      width:100%;
+      border-collapse: collapse;
+      min-width: 360px; /* keeps columns readable on small screens */
     }
     .table th, .table td{
       padding: 10px 10px;
       font-size: 13px;
       text-align:left;
       border-bottom: 1px solid rgba(15,23,42,.08);
+      white-space: nowrap;
     }
     .table th{
       font-size: 11px;
@@ -373,7 +404,15 @@ HTML_PAGE = """
       letter-spacing: .06em;
       color: rgba(15,23,42,.65);
     }
-    .muted{ color: rgba(15,23,42,.62); font-weight: 700; }
+
+    footer{
+      margin-top: 14px;
+      text-align:center;
+      color: rgba(15,23,42,.50);
+      font-weight: 800;
+      font-size: 12px;
+      padding: 8px 0 2px;
+    }
   </style>
 </head>
 <body>
@@ -398,7 +437,6 @@ HTML_PAGE = """
       <!-- LEFT: Jug -->
       <div class="card">
         <div class="jugWrap">
-          <!-- Jug SVG (unchanged from your current good version) -->
           <svg class="jugSvg" viewBox="0 0 280 420" role="img" aria-label="Jug fill shows weekly progress">
             <defs>
               <clipPath id="jugClip">
@@ -610,47 +648,53 @@ HTML_PAGE = """
         <div class="split">
           <div>
             <div class="muted" style="margin:4px 0 8px;">Leaderboard</div>
-            <table class="table">
-              <thead>
-                <tr><th>Rep</th><th>Total</th></tr>
-              </thead>
-              <tbody>
-                {% if rep_rows %}
-                  {% for rep, total in rep_rows %}
-                    <tr><td>{{ rep }}</td><td><b>{{ total }}</b></td></tr>
-                  {% endfor %}
-                {% else %}
-                  <tr><td colspan="2" class="muted">No entries yet</td></tr>
-                {% endif %}
-              </tbody>
-            </table>
+            <div class="tableWrap">
+              <table class="table">
+                <thead>
+                  <tr><th>Rep</th><th>Total</th></tr>
+                </thead>
+                <tbody>
+                  {% if rep_rows %}
+                    {% for rep, total in rep_rows %}
+                      <tr><td>{{ rep }}</td><td><b>{{ total }}</b></td></tr>
+                    {% endfor %}
+                  {% else %}
+                    <tr><td colspan="2" class="muted">No entries yet</td></tr>
+                  {% endif %}
+                </tbody>
+              </table>
+            </div>
           </div>
 
           <div>
             <div class="muted" style="margin:4px 0 8px;">Recent Activity</div>
-            <table class="table">
-              <thead>
-                <tr><th>Rep</th><th>Qty</th><th>Time</th></tr>
-              </thead>
-              <tbody>
-                {% if recent %}
-                  {% for e in recent %}
-                    <tr>
-                      <td>{{ e.rep }}</td>
-                      <td><b>+{{ e.qty }}</b></td>
-                      <td class="muted">{{ e.created_at }}</td>
-                    </tr>
-                  {% endfor %}
-                {% else %}
-                  <tr><td colspan="3" class="muted">No entries yet</td></tr>
-                {% endif %}
-              </tbody>
-            </table>
+            <div class="tableWrap">
+              <table class="table">
+                <thead>
+                  <tr><th>Rep</th><th>Qty</th><th>Time</th></tr>
+                </thead>
+                <tbody>
+                  {% if recent %}
+                    {% for e in recent %}
+                      <tr>
+                        <td>{{ e.rep }}</td>
+                        <td><b>+{{ e.qty }}</b></td>
+                        <td class="muted">{{ e.created_at }}</td>
+                      </tr>
+                    {% endfor %}
+                  {% else %}
+                    <tr><td colspan="3" class="muted">No entries yet</td></tr>
+                  {% endif %}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
 
       </div>
     </div>
+
+    <footer>{{ version }}</footer>
   </div>
 
   <script>
@@ -716,12 +760,10 @@ def index():
 
         return redirect(url_for("index", msg=message, ok=("1" if ok else "0"), rep=selected_rep))
 
-    # Load view data
     weekly_sales = week_total(wk_start)
     fill_percentage = clamp((weekly_sales / WEEKLY_GOAL) * 100 if WEEKLY_GOAL else 0, 0, 100)
     remaining = max(0, WEEKLY_GOAL - weekly_sales)
 
-    # Water fills including neck (same mapping you had)
     top_y = 46
     bottom_y = 380
     usable_h = bottom_y - top_y
@@ -743,7 +785,6 @@ def index():
         remaining=remaining,
         water_h=water_h,
         water_y=water_y,
-        today=today.isoformat(),
         range_label=week_label(wk_start),
         message=message,
         ok=ok,
@@ -751,6 +792,7 @@ def index():
         selected_rep=selected_rep,
         rep_rows=rep_rows,
         recent=recent,
+        version=APP_VERSION,
     )
 
 
@@ -773,7 +815,6 @@ def export_csv():
         w.writerow([r["week_start"], r["rep"], r["qty"], r["created_at"]])
 
     csv_bytes = output.getvalue().encode("utf-8")
-
     filename = f"primo_sales_{wk_start.isoformat()}.csv"
     return Response(
         csv_bytes,
