@@ -1,20 +1,33 @@
 from flask import (
     Flask, request, render_template_string, redirect, url_for,
-    Response, session
+    Response, session, abort
 )
-from datetime import date, timedelta
-import sqlite3
-from pathlib import Path
+from datetime import date, timedelta, datetime, timezone
 import os
 import csv
 import io
+
+# Python 3.9+ zoneinfo, but some Windows installs can be missing tzdata.
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
+# Postgres driver (psycopg v3)
+# requirements.txt: psycopg[binary]
+try:
+    import psycopg
+except Exception as e:
+    raise RuntimeError(
+        "Missing dependency psycopg. Add 'psycopg[binary]' to requirements.txt"
+    ) from e
+
 
 app = Flask(__name__)
 
 # ---------------- CONFIG ----------------
 WEEKLY_GOAL = 50
-DB_PATH = Path("sales.db")
-APP_VERSION = "V0.5"
+APP_VERSION = "V0.6"
 
 REPS = ["Tristan", "Ricky", "Sohaib"]
 ADMIN_REP = "Tristan"
@@ -34,162 +47,60 @@ USER_PASSWORDS = {
 }
 
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is missing. On Render: Service → Environment → add DATABASE_URL with your Postgres connection string."
+    )
 # ---------------------------------------
 
-_db_ready = False
+
+# -------- Timezone (Central, safe fallback) --------
+def get_central_tz():
+    # Best: DST-aware IANA TZ
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo("America/Chicago")
+        except Exception:
+            pass
+    # Fallback: fixed CST offset (no DST) but prevents crash
+    return timezone(timedelta(hours=-6))
 
 
-# ---------------- SQLite helpers ----------------
+TZ = get_central_tz()
+
+
+def local_today() -> date:
+    # Central date (so “today” and the +amount reset correctly overnight)
+    return datetime.now(TZ).date()
+
+
+# ---------------- Postgres helpers ----------------
 def db_conn():
-    if DB_PATH.parent and str(DB_PATH.parent) != ".":
-        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl_fragment: str):
-    cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    existing = {c["name"] for c in cols}
-    if column not in existing:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl_fragment}")
+    return psycopg.connect(DATABASE_URL)
 
 
 def init_db():
     with db_conn() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS sales_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                week_start TEXT NOT NULL,
-                rep TEXT NOT NULL,
-                qty INTEGER NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
-        ensure_column(conn, "sales_entries", "note", "note TEXT")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week ON sales_entries(week_start)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week_rep ON sales_entries(week_start, rep)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week_created ON sales_entries(week_start, created_at)")
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS sales_entries (
+                    id BIGSERIAL PRIMARY KEY,
+                    week_start DATE NOT NULL,
+                    rep TEXT NOT NULL,
+                    qty INTEGER NOT NULL CHECK (qty > 0),
+                    created_at DATE NOT NULL,
+                    note TEXT NOT NULL DEFAULT ''
+                );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week ON sales_entries(week_start);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week_rep ON sales_entries(week_start, rep);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week_created ON sales_entries(week_start, created_at);")
         conn.commit()
 
 
-def get_week_start(d: date) -> date:
-    return d - timedelta(days=d.weekday())  # Monday start
-
-
-def week_label(week_start: date) -> str:
-    week_end = week_start + timedelta(days=6)
-
-    def fmt(x: date):
-        return f"{x.month}/{x.day}/{str(x.year)[-2:]}"
-    return f"{fmt(week_start)}–{fmt(week_end)}"
-
-
-def clamp(n, lo, hi):
-    return max(lo, min(hi, n))
-
-
-def parse_week_start(s: str | None) -> date | None:
-    if not s:
-        return None
-    try:
-        return date.fromisoformat(s)
-    except Exception:
-        return None
-
-
-def list_weeks() -> list[str]:
-    with db_conn() as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT week_start FROM sales_entries ORDER BY week_start DESC"
-        ).fetchall()
-    return [r["week_start"] for r in rows]
-
-
-def week_total(week_start: date) -> int:
-    with db_conn() as conn:
-        row = conn.execute(
-            "SELECT COALESCE(SUM(qty), 0) AS total FROM sales_entries WHERE week_start = ?",
-            (week_start.isoformat(),)
-        ).fetchone()
-    return int(row["total"] or 0)
-
-
-def rep_totals(week_start: date) -> list[tuple[str, int]]:
-    with db_conn() as conn:
-        rows = conn.execute(
-            "SELECT rep, COALESCE(SUM(qty), 0) AS total "
-            "FROM sales_entries WHERE week_start = ? "
-            "GROUP BY rep ORDER BY total DESC, rep ASC",
-            (week_start.isoformat(),)
-        ).fetchall()
-    return [(r["rep"], int(r["total"])) for r in rows]
-
-
-def recent_entries(week_start: date, limit: int = 8) -> list[dict]:
-    with db_conn() as conn:
-        rows = conn.execute(
-            "SELECT id, rep, qty, created_at, COALESCE(note,'') AS note "
-            "FROM sales_entries WHERE week_start = ? "
-            "ORDER BY id DESC LIMIT ?",
-            (week_start.isoformat(), limit)
-        ).fetchall()
-
-    out = []
-    for r in rows:
-        out.append({
-            "id": int(r["id"]),
-            "rep": r["rep"],
-            "qty": int(r["qty"]),
-            "created_at": r["created_at"],
-            "store": r["note"] or "",
-        })
-    return out
-
-
-def add_entry(week_start: date, rep: str, qty: int, store_location: str):
-    qty = int(qty)
-    if qty <= 0:
-        raise ValueError("qty must be positive")
-
-    rep = (rep or "").strip() or DEFAULT_REP
-    if rep not in REPS:
-        raise ValueError("invalid rep")
-
-    store_location = (store_location or "").strip()
-    if store_location not in STORE_LOCATIONS:
-        raise ValueError("invalid store location")
-
-    created_date = date.today().isoformat()  # date only
-
-    with db_conn() as conn:
-        conn.execute(
-            "INSERT INTO sales_entries (week_start, rep, qty, created_at, note) VALUES (?, ?, ?, ?, ?)",
-            (week_start.isoformat(), rep, qty, created_date, store_location)
-        )
-        conn.commit()
-
-
-def undo_last_entry(week_start: date):
-    with db_conn() as conn:
-        row = conn.execute(
-            "SELECT id, rep, qty FROM sales_entries WHERE week_start = ? ORDER BY id DESC LIMIT 1",
-            (week_start.isoformat(),)
-        ).fetchone()
-        if row is None:
-            return None
-        entry_id = int(row["id"])
-        rep = row["rep"]
-        qty = int(row["qty"])
-        conn.execute("DELETE FROM sales_entries WHERE id = ?", (entry_id,))
-        conn.commit()
-        return {"id": entry_id, "rep": rep, "qty": qty}
-
-
-def reset_week(week_start: date):
-    with db_conn() as conn:
-        conn.execute("DELETE FROM sales_entries WHERE week_start = ?", (week_start.isoformat(),))
-        conn.commit()
+_db_ready = False
 
 
 @app.before_request
@@ -217,6 +128,167 @@ def require_login():
     if not is_logged_in():
         return redirect(url_for("login", next=request.path))
     return None
+
+
+# ---------------- Business logic ----------------
+def get_week_start(d: date) -> date:
+    return d - timedelta(days=d.weekday())  # Monday start
+
+
+def week_label(week_start: date) -> str:
+    week_end = week_start + timedelta(days=6)
+
+    def fmt(x: date):
+        return f"{x.month}/{x.day}/{str(x.year)[-2:]}"
+    return f"{fmt(week_start)}–{fmt(week_end)}"
+
+
+def clamp(n, lo, hi):
+    return max(lo, min(hi, n))
+
+
+def parse_week_start(s: str | None) -> date | None:
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def list_weeks() -> list[str]:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT week_start FROM sales_entries ORDER BY week_start DESC;")
+            rows = cur.fetchall()
+    return [r[0].isoformat() for r in rows]
+
+
+def week_total(week_start: date) -> int:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE(SUM(qty), 0) FROM sales_entries WHERE week_start = %s;",
+                (week_start,)
+            )
+            (total,) = cur.fetchone()
+    return int(total or 0)
+
+
+def rep_totals_with_today(week_start: date, today_central: date) -> list[tuple[str, int, int]]:
+    """
+    Returns list of (rep, week_total, today_total) for the selected week.
+    - today_total is ONLY qty submitted on today's Central date and resets automatically tomorrow.
+    """
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            # Week totals
+            cur.execute(
+                "SELECT rep, COALESCE(SUM(qty), 0) "
+                "FROM sales_entries WHERE week_start = %s "
+                "GROUP BY rep;",
+                (week_start,)
+            )
+            week_rows = cur.fetchall()
+
+            # Today's totals (Central date)
+            cur.execute(
+                "SELECT rep, COALESCE(SUM(qty), 0) "
+                "FROM sales_entries WHERE week_start = %s AND created_at = %s "
+                "GROUP BY rep;",
+                (week_start, today_central)
+            )
+            today_rows = cur.fetchall()
+
+    week_map = {rep: int(total or 0) for rep, total in week_rows}
+    today_map = {rep: int(total or 0) for rep, total in today_rows}
+
+    out = []
+    for rep in REPS:
+        out.append((rep, week_map.get(rep, 0), today_map.get(rep, 0)))
+
+    out.sort(key=lambda x: (-x[1], -x[2], x[0].lower()))
+    return out
+
+
+def store_totals_for_week(week_start: date) -> list[tuple[str, int]]:
+    """
+    Store production: weekly totals per store.
+    IMPORTANT: always returns ALL known stores with a number (0 if none),
+    so every row shows a value.
+    """
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT note, COALESCE(SUM(qty), 0) "
+                "FROM sales_entries "
+                "WHERE week_start = %s "
+                "GROUP BY note;",
+                (week_start,)
+            )
+            rows = cur.fetchall()
+
+    totals = {}
+    for store, total in rows:
+        store = (store or "").strip()
+        if store:
+            totals[store] = int(total or 0)
+
+    # Ensure every known store is present, even if 0
+    out = [(s, totals.get(s, 0)) for s in STORE_LOCATIONS]
+
+    # Sort by weekly total desc
+    out.sort(key=lambda x: (-x[1], x[0].lower()))
+    return out
+
+
+def add_entry(week_start: date, rep: str, qty: int, store_location: str):
+    qty = int(qty)
+    if qty <= 0:
+        raise ValueError("qty must be positive")
+
+    rep = (rep or "").strip() or DEFAULT_REP
+    if rep not in REPS:
+        raise ValueError("invalid rep")
+
+    store_location = (store_location or "").strip()
+    if store_location not in STORE_LOCATIONS:
+        raise ValueError("invalid store location")
+
+    created_date = local_today()
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO sales_entries (week_start, rep, qty, created_at, note) "
+                "VALUES (%s, %s, %s, %s, %s);",
+                (week_start, rep, qty, created_date, store_location)
+            )
+        conn.commit()
+
+
+def undo_last_entry(week_start: date):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, rep, qty FROM sales_entries WHERE week_start = %s "
+                "ORDER BY id DESC LIMIT 1;",
+                (week_start,)
+            )
+            row = cur.fetchone()
+            if row is None:
+                return None
+            entry_id, rep, qty = row
+            cur.execute("DELETE FROM sales_entries WHERE id = %s;", (entry_id,))
+        conn.commit()
+    return {"id": int(entry_id), "rep": rep, "qty": int(qty)}
+
+
+def reset_week(week_start: date):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM sales_entries WHERE week_start = %s;", (week_start,))
+        conn.commit()
 
 
 # ---------------- UI ----------------
@@ -271,9 +343,15 @@ LOGIN_PAGE = """
       color: rgba(15,23,42,.70);
       display:block; margin: 14px 0 6px;
     }
-    .fieldRow{ display:flex; gap:10px; align-items: center; }
+
+    .fieldRow{
+      display:flex;
+      gap:10px;
+      align-items: center;
+    }
     .input, .eyeBtn{
-      height: 46px; border-radius: 12px;
+      height: 46px;
+      border-radius: 12px;
       border: 1px solid rgba(15,23,42,.18);
       background: rgba(255,255,255,.98);
     }
@@ -302,6 +380,7 @@ LOGIN_PAGE = """
       box-shadow: 0 0 0 4px var(--focus);
       border-color: rgba(37,99,235,.55);
     }
+
     button.primary{
       width: 100%;
       margin-top: 14px;
@@ -331,6 +410,10 @@ LOGIN_PAGE = """
       color: rgba(15,23,42,.55);
       font-weight: 900;
       font-size: 12px;
+    }
+    @media (max-width: 420px){
+      .card{ padding: 16px; }
+      button.primary{ font-size: 16px; }
     }
   </style>
 </head>
@@ -387,11 +470,6 @@ LOGIN_PAGE = """
 """
 
 
-# ✅ SLEEK + NO FULL-PAGE SCROLL:
-# - compact header
-# - modest jug size
-# - entry UI in a tidy card
-# - tables are "peek" height with internal scroll (ONLY if needed)
 HTML_PAGE = """
 <!DOCTYPE html>
 <html>
@@ -418,13 +496,11 @@ HTML_PAGE = """
       background: radial-gradient(circle at 18% 12%, #ffffff 0%, var(--bgA) 40%, var(--bgB) 100%);
     }
 
-    /* Centered, not huge */
     .wrap{
       max-width: 1100px;
       margin: 0 auto;
     }
 
-    /* Compact header */
     .topbar{
       display:flex;
       flex-wrap:wrap;
@@ -476,7 +552,6 @@ HTML_PAGE = """
       background: rgba(255,255,255,.90);
     }
 
-    /* Main layout: balanced, not giant */
     .grid{
       display:grid;
       grid-template-columns: 1fr;
@@ -497,7 +572,6 @@ HTML_PAGE = """
       padding: 12px;
     }
 
-    /* Jug: smaller + clean */
     .jugPanel{
       border-radius: 16px;
       background: rgba(255,255,255,.88);
@@ -540,7 +614,6 @@ HTML_PAGE = """
     .flash.ok{ border-color: rgba(34,197,94,.25); background: rgba(34,197,94,.10); }
     .flash.bad{ border-color: rgba(239,68,68,.28); background: rgba(239,68,68,.10); }
 
-    /* Right side sections */
     .sectionHead{
       display:flex;
       align-items:center;
@@ -558,7 +631,6 @@ HTML_PAGE = """
       margin-bottom: 10px;
     }
 
-    /* Week select compact row */
     .weekRow{
       display:flex;
       gap:10px;
@@ -568,7 +640,6 @@ HTML_PAGE = """
     }
     .weekRow > select{ flex: 1 1 280px; }
 
-    /* Entry card: vertical but not tall */
     form.controls{
       display:grid;
       grid-template-columns: 1fr;
@@ -658,7 +729,6 @@ HTML_PAGE = """
       padding: 0 14px;
     }
 
-    /* Tables: compact "peek" height so page doesn't scroll */
     .tables{
       display:grid;
       grid-template-columns: 1fr;
@@ -684,10 +754,20 @@ HTML_PAGE = """
       text-transform: uppercase;
       letter-spacing: .04em;
     }
+
+    /* Mobile: internal scroll if needed */
     .tableWrap{
-      max-height: 220px; /* ✅ prevents full page scroll */
+      max-height: 220px;
       overflow:auto;
     }
+    /* Desktop: no internal scroll */
+    @media (min-width: 980px){
+      .tableWrap{
+        max-height: none;
+        overflow: visible;
+      }
+    }
+
     table{
       width:100%;
       border-collapse: collapse;
@@ -711,6 +791,22 @@ HTML_PAGE = """
       letter-spacing: .06em;
       color: rgba(15,23,42,.65);
       background: rgba(255,255,255,.98);
+    }
+
+    /* --- Store Production table: always show the numbers column (no horizontal hiding) --- */
+    table.storeTable{
+      min-width: 0 !important;   /* override global min-width */
+      width: 100% !important;
+      table-layout: fixed;       /* forces both columns to fit */
+    }
+    table.storeTable th,
+    table.storeTable td{
+      white-space: normal !important; /* override global nowrap */
+    }
+    table.storeTable th:last-child,
+    table.storeTable td:last-child{
+      text-align: right;
+      width: 90px;               /* reserves space for the number */
     }
 
     footer{
@@ -799,9 +895,9 @@ HTML_PAGE = """
 
                 <linearGradient id="sheen" x1="0" x2="1">
                   <stop offset="0" stop-color="rgba(255,255,255,0.12)"/>
-                  <stop offset="0.35" stop-color="rgba(255,255,255,0.04)"/>
-                  <stop offset="0.60" stop-color="rgba(0,0,0,0.04)"/>
-                  <stop offset="1" stop-color="rgba(255,255,255,0.10)"/>
+                  <stop offset="0.35" stop-color="rgba(255,255,255,0.04)" />
+                  <stop offset="0.60" stop-color="rgba(0,0,0,0.04)" />
+                  <stop offset="1" stop-color="rgba(255,255,255,0.10)" />
                 </linearGradient>
 
                 <path id="primoArc" d="M86 198 C122 190 158 190 194 198" />
@@ -950,6 +1046,7 @@ HTML_PAGE = """
         </form>
 
         <div class="tables">
+          <!-- BOX 1: Leaderboard -->
           <div class="tableCard">
             <div class="tableTitle">Leaderboard</div>
             <div class="tableWrap">
@@ -959,8 +1056,16 @@ HTML_PAGE = """
                 </thead>
                 <tbody>
                   {% if rep_rows %}
-                    {% for rep, total in rep_rows %}
-                      <tr><td>{{ rep }}</td><td><b>{{ total }}</b></td></tr>
+                    {% for rep, total, today_total in rep_rows %}
+                      <tr>
+                        <td>{{ rep }}</td>
+                        <td>
+                          <b>{{ total }}</b>
+                          <span style="color: rgba(15,23,42,.62); font-weight: 900;">
+                            &nbsp;&nbsp;+{{ today_total }}
+                          </span>
+                        </td>
+                      </tr>
                     {% endfor %}
                   {% else %}
                     <tr><td colspan="2" style="color: rgba(15,23,42,.60); font-weight: 900;">No entries yet</td></tr>
@@ -970,25 +1075,24 @@ HTML_PAGE = """
             </div>
           </div>
 
+          <!-- BOX 2: Store production (weekly totals per store) -->
           <div class="tableCard">
-            <div class="tableTitle">Recent activity</div>
+            <div class="tableTitle">Store production</div>
             <div class="tableWrap">
-              <table>
+              <table class="storeTable">
                 <thead>
-                  <tr><th>Rep</th><th>Qty</th><th>Store</th><th>Date</th></tr>
+                  <tr><th>Store</th><th>Week</th></tr>
                 </thead>
                 <tbody>
-                  {% if recent %}
-                    {% for e in recent %}
+                  {% if store_rows %}
+                    {% for store, total in store_rows %}
                       <tr>
-                        <td>{{ e.rep }}</td>
-                        <td><b>+{{ e.qty }}</b></td>
-                        <td style="color: rgba(15,23,42,.62); font-weight: 900;">{{ e.store }}</td>
-                        <td style="color: rgba(15,23,42,.62); font-weight: 900;">{{ e.created_at }}</td>
+                        <td>{{ store }}</td>
+                        <td><b>{{ total }}</b></td>
                       </tr>
                     {% endfor %}
                   {% else %}
-                    <tr><td colspan="4" style="color: rgba(15,23,42,.60); font-weight: 900;">No entries yet</td></tr>
+                    <tr><td colspan="2" style="color: rgba(15,23,42,.60); font-weight: 900;">No entries yet</td></tr>
                   {% endif %}
                 </tbody>
               </table>
@@ -1021,6 +1125,7 @@ HTML_PAGE = """
 """
 
 
+# ---------------- Routes ----------------
 @app.route("/login", methods=["GET", "POST"])
 def login():
     next_url = request.args.get("next") or request.form.get("next") or url_for("index")
@@ -1061,7 +1166,7 @@ def index():
     if gate:
         return gate
 
-    today = date.today()
+    today = local_today()
     current_wk_start = get_week_start(today)
 
     requested = parse_week_start(request.args.get("week") or request.form.get("week"))
@@ -1115,7 +1220,7 @@ def index():
     fill_percentage = clamp((weekly_sales / WEEKLY_GOAL) * 100 if WEEKLY_GOAL else 0, 0, 100)
     remaining = max(0, WEEKLY_GOAL - weekly_sales)
 
-    # Water fill mapping (fits the jug better at the bottom)
+    # Water fill mapping (same)
     top_y = 64
     bottom_y = 388
     usable_h = bottom_y - top_y
@@ -1130,8 +1235,12 @@ def index():
     water_h = int(round(max(0, water_h)))
     water_y = int(round(water_y))
 
-    rep_rows = rep_totals(selected_wk_start)
-    recent = recent_entries(selected_wk_start, limit=8)  # ✅ smaller to reduce height
+    # Leaderboard + daily +amount (Central date)
+    rep_rows = rep_totals_with_today(selected_wk_start, today)
+
+    # Store production = weekly totals per store (ALWAYS 4 rows with numbers)
+    store_rows = store_totals_for_week(selected_wk_start)
+
     weeks = list_weeks()
 
     return render_template_string(
@@ -1152,7 +1261,7 @@ def index():
         message=message,
         ok=ok,
         rep_rows=rep_rows,
-        recent=recent,
+        store_rows=store_rows,
         version=APP_VERSION,
         stores=STORE_LOCATIONS
     )
@@ -1164,23 +1273,25 @@ def export_csv():
     if gate:
         return gate
 
-    today = date.today()
+    today = local_today()
     current_wk_start = get_week_start(today)
     wk = parse_week_start(request.args.get("week"))
     week_start = wk or current_wk_start
 
     with db_conn() as conn:
-        rows = conn.execute(
-            "SELECT week_start, rep, qty, COALESCE(note,'') AS store_location, created_at "
-            "FROM sales_entries WHERE week_start = ? ORDER BY id ASC",
-            (week_start.isoformat(),)
-        ).fetchall()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT week_start, rep, qty, COALESCE(note,''), created_at "
+                "FROM sales_entries WHERE week_start = %s ORDER BY id ASC;",
+                (week_start,)
+            )
+            rows = cur.fetchall()
 
     output = io.StringIO()
     w = csv.writer(output)
     w.writerow(["week_start", "rep", "qty", "store_location", "date"])
-    for r in rows:
-        w.writerow([r["week_start"], r["rep"], r["qty"], r["store_location"], r["created_at"]])
+    for week_s, rep, qty, store, created in rows:
+        w.writerow([week_s.isoformat(), rep, int(qty), store, created.isoformat()])
 
     csv_bytes = output.getvalue().encode("utf-8")
     filename = f"primo_sales_{week_start.isoformat()}.csv"
@@ -1189,6 +1300,28 @@ def export_csv():
         mimetype="text/csv",
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
+
+
+# Optional: quick sanity check route (admin only) to confirm data persists
+@app.route("/db-status")
+def db_status():
+    if not (session.get("logged_in") and session.get("rep") == ADMIN_REP):
+        abort(403)
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM sales_entries;")
+            (count,) = cur.fetchone()
+            cur.execute("SELECT current_database(), current_user;")
+            dbname, dbuser = cur.fetchone()
+
+    return {
+        "ok": True,
+        "database": dbname,
+        "user": dbuser,
+        "rows_in_sales_entries": int(count),
+        "central_today": local_today().isoformat(),
+    }
 
 
 if __name__ == "__main__":
