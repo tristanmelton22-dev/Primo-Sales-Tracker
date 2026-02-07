@@ -59,12 +59,9 @@ if not DATABASE_URL:
     )
 
 # ---------------- SLACK CONFIG ----------------
-# You set these in Render → Environment
 SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET", "").strip()
 SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "").strip()
 
-# Put each person's Slack member ID in Render env vars:
-# SLACK_TRISTAN_ID, SLACK_RICKY_ID, SLACK_SOHAIB_ID
 SLACK_TRISTAN_ID = os.environ.get("SLACK_TRISTAN_ID", "").strip()
 SLACK_RICKY_ID = os.environ.get("SLACK_RICKY_ID", "").strip()
 SLACK_SOHAIB_ID = os.environ.get("SLACK_SOHAIB_ID", "").strip()
@@ -130,11 +127,7 @@ _db_ready = False
 
 @app.before_request
 def ensure_db():
-    """
-    Slack verifies your URL by sending a challenge.
-    We do NOT want the app to fail verification because the DB is slow/unreachable.
-    So we skip DB init for /slack/events.
-    """
+    # Don't block Slack URL verification with DB work
     global _db_ready
     if request.path.startswith("/slack/events"):
         return
@@ -208,10 +201,6 @@ def week_total(week_start: date) -> int:
 
 
 def rep_totals_with_today(week_start: date, today_central: date) -> list[tuple[str, int, int]]:
-    """
-    Returns list of (rep, week_total, today_total)
-    today_total is ONLY qty submitted on today's Central date and resets automatically tomorrow.
-    """
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -242,10 +231,6 @@ def rep_totals_with_today(week_start: date, today_central: date) -> list[tuple[s
 
 
 def store_totals_for_week(week_start: date) -> list[tuple[str, int]]:
-    """
-    Store production: weekly totals per store.
-    Always returns ALL 4 stores with a number (0 if none).
-    """
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -317,11 +302,6 @@ def add_entry(week_start: date, rep: str, qty: int, store_location: str):
 
 
 def add_entry_from_slack(week_start: date, rep: str, qty: int):
-    """
-    Slack posts add +1 when message contains 'water'.
-    Store is not provided, so we use note='Slack'.
-    Store Production totals stay based on the 4 known stores.
-    """
     qty = int(qty)
     if qty <= 0:
         raise ValueError("qty must be positive")
@@ -355,7 +335,6 @@ def update_entry(entry_id: int, qty: int, store_location: str):
         raise ValueError("qty must be positive")
 
     store_location = (store_location or "").strip()
-    # Allow keeping Slack rows as Slack; admin can also set to a real store.
     if store_location != "Slack" and store_location not in STORE_LOCATIONS:
         raise ValueError("invalid store")
 
@@ -890,6 +869,8 @@ HTML_PAGE = """
       border: 1px solid rgba(15,23,42,.08);
       overflow:hidden;
     }
+
+    /* ✅ header row with Slack logo on the right */
     .tableTitle{
       padding: 10px 12px;
       font-weight: 950;
@@ -899,7 +880,26 @@ HTML_PAGE = """
       border-bottom: 1px solid rgba(15,23,42,.08);
       text-transform: uppercase;
       letter-spacing: .04em;
+
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
     }
+    .titleLeft{ display:flex; align-items:center; gap:8px; }
+    .slackIcon{
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      width: 22px;
+      height: 22px;
+      border-radius: 8px;
+      background: rgba(255,255,255,.90);
+      border: 1px solid rgba(15,23,42,.10);
+      box-shadow: 0 8px 12px rgba(0,0,0,.06);
+      flex: 0 0 auto;
+    }
+    .slackIcon svg{ width: 14px; height: 14px; display:block; }
 
     .tableWrap{
       max-height: 220px;
@@ -952,7 +952,45 @@ HTML_PAGE = """
       width: 90px;
     }
 
-    /* Admin manage table */
+    /* Admin manage: collapsible + scroll */
+    details.manageDetails{
+      margin-top: 12px;
+      border-radius: 16px;
+      background: rgba(255,255,255,.88);
+      border: 1px solid rgba(15,23,42,.08);
+      overflow:hidden;
+    }
+    details.manageDetails > summary{
+      list-style: none;
+      cursor: pointer;
+      padding: 10px 12px;
+      font-weight: 950;
+      font-size: 12px;
+      color: rgba(15,23,42,.78);
+      background: rgba(15,23,42,.05);
+      border-bottom: 1px solid rgba(15,23,42,.08);
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      user-select:none;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+    }
+    details.manageDetails > summary::-webkit-details-marker{ display:none; }
+    .chev{
+      font-size: 12px;
+      color: rgba(15,23,42,.55);
+      font-weight: 950;
+    }
+    .manageWrap{
+      max-height: 260px;
+      overflow: auto;
+    }
+    @media (max-width: 520px){
+      .manageWrap{ max-height: 320px; }
+    }
+
     table.manageTable{
       min-width: 0 !important;
       width: 100% !important;
@@ -1174,7 +1212,6 @@ HTML_PAGE = """
 
         {% if admin %}
           <!-- ADMIN ONLY: manual add / undo / reset / export -->
-          <div class="sectionHead" style="margin-top: 2px;">Admin controls</div>
           <form method="POST" id="salesForm" class="controls" autocomplete="off">
             <input type="hidden" name="week" value="{{ selected_week_start }}">
 
@@ -1209,17 +1246,29 @@ HTML_PAGE = """
             </div>
           </form>
         {% else %}
-          <!-- NON-ADMIN: no manual add -->
-          <div class="flash ok" style="margin-bottom: 12px;">
-            Sales auto-update from Slack. To add/remove/edit manually, log in as <b>Tristan</b>.
-          </div>
+          <!-- NON-ADMIN: no green box + no manual add -->
           <a class="btn" href="{{ url_for('export_csv', week=selected_week_start) }}">Export CSV</a>
         {% endif %}
 
         <div class="tables" style="margin-top: 12px;">
           <!-- BOX 1: Leaderboard -->
           <div class="tableCard">
-            <div class="tableTitle">Leaderboard</div>
+            <div class="tableTitle">
+              <div class="titleLeft">Leaderboard</div>
+              <div class="slackIcon" title="Auto-updates from Slack" aria-label="Slack">
+                <!-- simple Slack-ish 4-dot icon -->
+                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M7.5 14.5a2 2 0 1 1-2-2h2v2Z" fill="#E01E5A"/>
+                  <path d="M8.5 14.5a2 2 0 1 1 2-2v2h-2Z" fill="#E01E5A"/>
+                  <path d="M9.5 7.5a2 2 0 1 1 2-2v2h-2Z" fill="#36C5F0"/>
+                  <path d="M9.5 8.5a2 2 0 1 1 2 2h-2v-2Z" fill="#36C5F0"/>
+                  <path d="M16.5 9.5a2 2 0 1 1 2 2h-2v-2Z" fill="#2EB67D"/>
+                  <path d="M15.5 9.5a2 2 0 1 1-2 2v-2h2Z" fill="#2EB67D"/>
+                  <path d="M14.5 16.5a2 2 0 1 1-2 2v-2h2Z" fill="#ECB22E"/>
+                  <path d="M14.5 15.5a2 2 0 1 1 2-2v2h-2Z" fill="#ECB22E"/>
+                </svg>
+              </div>
+            </div>
             <div class="tableWrap">
               <table>
                 <thead>
@@ -1248,7 +1297,21 @@ HTML_PAGE = """
 
           <!-- BOX 2: Store production -->
           <div class="tableCard">
-            <div class="tableTitle">Store production</div>
+            <div class="tableTitle">
+              <div class="titleLeft">Store production</div>
+              <div class="slackIcon" title="Auto-updates from Slack" aria-label="Slack">
+                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M7.5 14.5a2 2 0 1 1-2-2h2v2Z" fill="#E01E5A"/>
+                  <path d="M8.5 14.5a2 2 0 1 1 2-2v2h-2Z" fill="#E01E5A"/>
+                  <path d="M9.5 7.5a2 2 0 1 1 2-2v2h-2Z" fill="#36C5F0"/>
+                  <path d="M9.5 8.5a2 2 0 1 1 2 2h-2v-2Z" fill="#36C5F0"/>
+                  <path d="M16.5 9.5a2 2 0 1 1 2 2h-2v-2Z" fill="#2EB67D"/>
+                  <path d="M15.5 9.5a2 2 0 1 1-2 2v-2h2Z" fill="#2EB67D"/>
+                  <path d="M14.5 16.5a2 2 0 1 1-2 2v-2h2Z" fill="#ECB22E"/>
+                  <path d="M14.5 15.5a2 2 0 1 1 2-2v2h-2Z" fill="#ECB22E"/>
+                </svg>
+              </div>
+            </div>
             <div class="tableWrap">
               <table class="storeTable">
                 <thead>
@@ -1272,10 +1335,14 @@ HTML_PAGE = """
         </div>
 
         {% if admin %}
-          <!-- ADMIN ONLY: Edit / Delete recent entries -->
-          <div class="tableCard" style="margin-top: 12px;">
-            <div class="tableTitle">Admin — manage entries (edit/delete)</div>
-            <div class="tableWrap">
+          <!-- ADMIN ONLY: Manage Entries collapsible -->
+          <details class="manageDetails">
+            <summary>
+              Admin — manage entries (edit/delete)
+              <span class="chev">▼</span>
+            </summary>
+
+            <div class="manageWrap">
               <table class="manageTable">
                 <thead>
                   <tr>
@@ -1327,7 +1394,7 @@ HTML_PAGE = """
                 </tbody>
               </table>
             </div>
-          </div>
+          </details>
         {% endif %}
 
         <footer>{{ version }}</footer>
@@ -1410,9 +1477,9 @@ def index():
     if request.method == "POST":
         action = request.form.get("action", "")
 
-        # Non-admin cannot mutate data from the UI anymore
+        # Non-admin cannot mutate data from the UI
         if not admin:
-            message = "Sales are pulled from Slack. Only Tristan can add/remove/edit manually."
+            message = "Sales are pulled from Slack."
             ok = False
             return redirect(url_for("index", week=selected_wk_start.isoformat(), msg=message, ok="0"))
 
@@ -1501,7 +1568,6 @@ def index():
     )
 
 
-# Admin-only edit/update
 @app.route("/admin/update", methods=["POST"])
 def admin_update():
     gate = require_login()
@@ -1528,7 +1594,6 @@ def admin_update():
     return redirect(url_for("index", week=week_start.isoformat(), msg=msg, ok=ok))
 
 
-# Admin-only delete
 @app.route("/admin/delete", methods=["POST"])
 def admin_delete():
     gate = require_login()
@@ -1587,7 +1652,7 @@ def export_csv():
     )
 
 
-# ---------------- SLACK EVENTS (AUTO +1 WHEN MESSAGE CONTAINS "water") ----------------
+# ---------------- SLACK EVENTS ----------------
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
     raw = request.get_data(as_text=True) or ""
@@ -1596,23 +1661,24 @@ def slack_events():
     except Exception:
         payload = {}
 
-    # 1) Slack URL verification (must respond with JSON {"challenge": "..."} )
+    # Slack URL verification
     if payload.get("type") == "url_verification":
         return jsonify({"challenge": payload.get("challenge", "")})
 
-    # 2) Verify Slack signature
+    # Verify signature
     if not slack_verify_request(request):
         return Response("invalid signature", status=403)
 
-    # 3) De-dupe
+    # Ensure DB after signature
+    global _db_ready
+    if not _db_ready:
+        init_db()
+        _db_ready = True
+
+    # De-dupe
     event_id = payload.get("event_id", "")
-    if event_id:
-        global _db_ready
-        if not _db_ready:
-            init_db()
-            _db_ready = True
-        if slack_event_already_processed(event_id):
-            return Response("ok", status=200)
+    if event_id and slack_event_already_processed(event_id):
+        return Response("ok", status=200)
 
     event = payload.get("event", {}) or {}
     if event.get("type") != "message":
@@ -1638,7 +1704,6 @@ def slack_events():
     if "water" not in text.lower():
         return Response("ok", status=200)
 
-    # Add +1 for current week
     wk_start = get_week_start(local_today())
     add_entry_from_slack(wk_start, rep, 1)
 
@@ -1648,7 +1713,6 @@ def slack_events():
     return Response("ok", status=200)
 
 
-# Optional: quick sanity route (admin only)
 @app.route("/db-status")
 def db_status():
     if not (session.get("logged_in") and session.get("rep") == ADMIN_REP):
@@ -1671,7 +1735,6 @@ def db_status():
 
 
 if __name__ == "__main__":
-    # Do NOT init_db() here (keeps deploy stable + Slack verification reliable)
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
 
