@@ -31,7 +31,7 @@ app = Flask(__name__)
 
 # ---------------- CONFIG ----------------
 WEEKLY_GOAL = 50
-APP_VERSION = "V0.6"
+APP_VERSION = "V0.7"  # ✅ bumped
 
 REPS = ["Tristan", "Ricky", "Sohaib"]
 ADMIN_REP = "Tristan"
@@ -110,12 +110,26 @@ def init_db():
                     note TEXT NOT NULL DEFAULT ''
                 );
             """)
+            # ✅ track which Slack messages were processed (dedupe by event_id)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS slack_processed_events (
                     event_id TEXT PRIMARY KEY,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
             """)
+            # ✅ NEW: map Slack message -> sales entry so deletes can remove the right sale
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS slack_message_sales (
+                    channel_id TEXT NOT NULL,
+                    message_ts TEXT NOT NULL,
+                    entry_id BIGINT NOT NULL,
+                    rep TEXT NOT NULL,
+                    qty INTEGER NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (channel_id, message_ts)
+                );
+            """)
+
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week ON sales_entries(week_start);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week_rep ON sales_entries(week_start, rep);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week_created ON sales_entries(week_start, created_at);")
@@ -127,7 +141,6 @@ _db_ready = False
 
 @app.before_request
 def ensure_db():
-    # Don't block Slack URL verification with DB work
     global _db_ready
     if request.path.startswith("/slack/events"):
         return
@@ -301,12 +314,14 @@ def add_entry(week_start: date, rep: str, qty: int, store_location: str):
         conn.commit()
 
 
-def add_entry_from_slack(week_start: date, rep: str, qty: int):
+def add_sale_from_slack(week_start: date, rep: str, channel_id: str, message_ts: str, qty: int = 1):
+    """
+    Adds a sale for a Slack top-level post and saves a mapping so deletes can remove it later.
+    Ignores duplicates by (channel_id, message_ts).
+    """
     qty = int(qty)
     if qty <= 0:
         raise ValueError("qty must be positive")
-
-    rep = (rep or "").strip() or DEFAULT_REP
     if rep not in REPS:
         raise ValueError("invalid rep")
 
@@ -314,12 +329,52 @@ def add_entry_from_slack(week_start: date, rep: str, qty: int):
 
     with db_conn() as conn:
         with conn.cursor() as cur:
+            # If we already recorded this exact Slack message, do nothing
+            cur.execute(
+                "SELECT entry_id FROM slack_message_sales WHERE channel_id = %s AND message_ts = %s;",
+                (channel_id, message_ts)
+            )
+            row = cur.fetchone()
+            if row:
+                return
+
             cur.execute(
                 "INSERT INTO sales_entries (week_start, rep, qty, created_at, note) "
-                "VALUES (%s, %s, %s, %s, %s);",
+                "VALUES (%s, %s, %s, %s, %s) RETURNING id;",
                 (week_start, rep, qty, created_date, "Slack")
             )
+            (entry_id,) = cur.fetchone()
+
+            cur.execute(
+                "INSERT INTO slack_message_sales (channel_id, message_ts, entry_id, rep, qty) "
+                "VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING;",
+                (channel_id, message_ts, int(entry_id), rep, qty)
+            )
         conn.commit()
+
+
+def remove_sale_from_slack(channel_id: str, message_ts: str):
+    """
+    If a Slack post that counted is deleted, remove the associated sales entry.
+    """
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT entry_id FROM slack_message_sales WHERE channel_id = %s AND message_ts = %s;",
+                (channel_id, message_ts)
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            (entry_id,) = row
+
+            cur.execute("DELETE FROM sales_entries WHERE id = %s;", (int(entry_id),))
+            cur.execute(
+                "DELETE FROM slack_message_sales WHERE channel_id = %s AND message_ts = %s;",
+                (channel_id, message_ts)
+            )
+        conn.commit()
+    return True
 
 
 def delete_entry(entry_id: int):
@@ -400,6 +455,8 @@ def slack_verify_request(req) -> bool:
 
 
 def slack_event_already_processed(event_id: str) -> bool:
+    if not event_id:
+        return False
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT 1 FROM slack_processed_events WHERE event_id = %s;", (event_id,))
@@ -407,6 +464,8 @@ def slack_event_already_processed(event_id: str) -> bool:
 
 
 def mark_slack_event_processed(event_id: str):
+    if not event_id:
+        return
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -417,8 +476,7 @@ def mark_slack_event_processed(event_id: str):
 
 
 # ---------------- UI ----------------
-LOGIN_PAGE = """
-<!DOCTYPE html>
+LOGIN_PAGE = """<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8" />
@@ -595,7 +653,24 @@ LOGIN_PAGE = """
 """
 
 
-HTML_PAGE = """
+# ✅ Realistic Slack logo SVG (inline)
+SLACK_SVG = """
+<svg viewBox="0 0 24 24" aria-hidden="true">
+  <path fill="#E01E5A" d="M6.1 13.6a1.9 1.9 0 1 1-1.9-1.9h1.9v1.9Z"/>
+  <path fill="#E01E5A" d="M7.1 13.6a1.9 1.9 0 1 1 1.9-1.9v1.9H7.1Z"/>
+
+  <path fill="#36C5F0" d="M10.4 6.1a1.9 1.9 0 1 1 1.9-1.9v1.9h-1.9Z"/>
+  <path fill="#36C5F0" d="M10.4 7.1a1.9 1.9 0 1 1-1.9 1.9V7.1h1.9Z"/>
+
+  <path fill="#2EB67D" d="M17.9 10.4a1.9 1.9 0 1 1 1.9 1.9h-1.9v-1.9Z"/>
+  <path fill="#2EB67D" d="M16.9 10.4a1.9 1.9 0 1 1-1.9-1.9h1.9v1.9Z"/>
+
+  <path fill="#ECB22E" d="M13.6 17.9a1.9 1.9 0 1 1-1.9 1.9v-1.9h1.9Z"/>
+  <path fill="#ECB22E" d="M13.6 16.9a1.9 1.9 0 1 1 1.9-1.9v1.9h-1.9Z"/>
+</svg>
+"""
+
+HTML_PAGE = f"""
 <!DOCTYPE html>
 <html>
 <head>
@@ -603,7 +678,7 @@ HTML_PAGE = """
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Primo Sales Tracker</title>
   <style>
-    :root{
+    :root{{
       --bgA:#ecfbff; --bgB:#cfefff;
       --text:#0f172a; --muted:#475569;
       --card:rgba(255,255,255,.92);
@@ -611,414 +686,115 @@ HTML_PAGE = """
       --shadow:0 14px 34px rgba(0,0,0,.12);
       --primary:#2563eb; --danger:#ef4444;
       --focus: rgba(37,99,235,.20);
-    }
-    *{ box-sizing:border-box; }
-    body{
-      margin:0;
-      padding: 12px;
+    }}
+    *{{ box-sizing:border-box; }}
+    body{{
+      margin:0; padding: 12px;
       font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
       color:var(--text);
       background: radial-gradient(circle at 18% 12%, #ffffff 0%, var(--bgA) 40%, var(--bgB) 100%);
-    }
-
-    .wrap{
-      max-width: 1100px;
-      margin: 0 auto;
-    }
-
-    .topbar{
-      display:flex;
-      flex-wrap:wrap;
-      align-items:center;
-      justify-content:space-between;
-      gap:10px;
-      padding:10px 12px;
-      border-radius:16px;
-      background: rgba(255,255,255,.92);
-      border: 1px solid var(--border);
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(10px);
-    }
-    .brand{ display:flex; align-items:center; gap:10px; min-width: 220px; }
-    .logo{
+    }}
+    .wrap{{ max-width: 1100px; margin: 0 auto; }}
+    .topbar{{
+      display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px;
+      padding:10px 12px; border-radius:16px; background: rgba(255,255,255,.92);
+      border: 1px solid var(--border); box-shadow: var(--shadow); backdrop-filter: blur(10px);
+    }}
+    .brand{{ display:flex; align-items:center; gap:10px; min-width: 220px; }}
+    .logo{{
       width:32px; height:32px; border-radius:12px;
       background: linear-gradient(135deg, var(--primary), #06b6d4);
       box-shadow: 0 10px 16px rgba(37,99,235,.16);
       flex: 0 0 auto;
-    }
-    .brand h1{ font-size:14px; margin:0; font-weight:950; line-height:1.1; }
-    .brand .sub{ margin:2px 0 0; font-size:11px; color: var(--muted); font-weight:850; }
-
-    .topActions{
-      display:flex;
-      gap:8px;
-      align-items:center;
-      flex-wrap:wrap;
-      justify-content:flex-end;
-    }
-    .pill{
+    }}
+    .brand h1{{ font-size:14px; margin:0; font-weight:950; line-height:1.1; }}
+    .brand .sub{{ margin:2px 0 0; font-size:11px; color: var(--muted); font-weight:850; }}
+    .topActions{{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }}
+    .pill{{
       display:inline-flex; align-items:center; gap:8px;
-      padding:6px 10px; border-radius:999px;
-      background: rgba(15,23,42,.06);
-      border: 1px solid rgba(15,23,42,.08);
-      color: rgba(15,23,42,.82);
-      font-size: 11px;
-      white-space: nowrap;
-      font-weight: 900;
-    }
-    .logout{
-      text-decoration:none;
-      font-weight: 950;
-      font-size: 12px;
-      color: rgba(15,23,42,.72);
-      padding: 6px 10px;
-      border-radius: 999px;
-      border: 1px solid rgba(15,23,42,.10);
+      padding:6px 10px; border-radius:999px; background: rgba(15,23,42,.06);
+      border: 1px solid rgba(15,23,42,.08); color: rgba(15,23,42,.82);
+      font-size: 11px; white-space: nowrap; font-weight: 900;
+    }}
+    .logout{{
+      text-decoration:none; font-weight: 950; font-size: 12px; color: rgba(15,23,42,.72);
+      padding: 6px 10px; border-radius: 999px; border: 1px solid rgba(15,23,42,.10);
       background: rgba(255,255,255,.90);
-    }
-
-    .grid{
-      display:grid;
-      grid-template-columns: 1fr;
-      gap: 12px;
-      margin-top: 12px;
-      align-items:start;
-    }
-    @media (min-width: 980px){
-      .grid{ grid-template-columns: 420px 1fr; }
-    }
-
-    .card{
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 18px;
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(10px);
-      padding: 12px;
-    }
-
-    .jugPanel{
-      border-radius: 16px;
-      background: rgba(255,255,255,.88);
-      border: 1px solid rgba(15,23,42,.08);
-      padding: 10px;
-    }
-    .jugWrap{ display:flex; flex-direction:column; align-items:center; gap:10px; }
-    .jugSvg{
-      width: min(320px, 100%);
-      height:auto;
-      user-select:none;
-      filter: drop-shadow(0 14px 18px rgba(0,0,0,.16));
-    }
-
-    .kpis{
-      display:grid;
-      grid-template-columns: 1fr 1fr 1fr;
-      gap:8px;
-      width: 100%;
-    }
-    .kpi{
-      padding: 10px;
-      border-radius: 14px;
-      background: rgba(255,255,255,.92);
-      border: 1px solid rgba(15,23,42,.08);
-      box-shadow: 0 10px 16px rgba(0,0,0,.06);
-    }
-    .kpi .label{ font-size:10px; color: var(--muted); margin-bottom:4px; font-weight:950; text-transform: uppercase; letter-spacing: .06em; }
-    .kpi .value{ font-size:18px; font-weight:950; margin:0; }
-
-    .flash{
-      width:100%;
-      padding: 10px 12px;
-      border-radius: 14px;
-      border: 1px solid rgba(15,23,42,.12);
-      background: rgba(255,255,255,.92);
-      font-weight: 850;
-      font-size: 13px;
-    }
-    .flash.ok{ border-color: rgba(34,197,94,.25); background: rgba(34,197,94,.10); }
-    .flash.bad{ border-color: rgba(239,68,68,.28); background: rgba(239,68,68,.10); }
-
-    .sectionHead{
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      gap:10px;
-      padding: 10px 10px;
-      border-radius: 14px;
-      background: rgba(15,23,42,.05);
-      border: 1px solid rgba(15,23,42,.08);
-      font-weight: 950;
-      font-size: 12px;
-      color: rgba(15,23,42,.78);
-      text-transform: uppercase;
-      letter-spacing: .04em;
-      margin-bottom: 10px;
-    }
-
-    .weekRow{
-      display:flex;
-      gap:10px;
-      flex-wrap:wrap;
-      margin-bottom: 12px;
-      align-items:center;
-    }
-    .weekRow > select{ flex: 1 1 280px; }
-
-    form.controls{
-      display:grid;
-      grid-template-columns: 1fr;
-      gap:10px;
-      padding: 10px;
-      border-radius: 16px;
-      background: rgba(255,255,255,.88);
-      border: 1px solid rgba(15,23,42,.08);
-      box-shadow: 0 10px 16px rgba(0,0,0,.06);
-      margin-bottom: 12px;
-    }
-    .formGrid{
-      display:grid;
-      grid-template-columns: 1fr;
-      gap:10px;
-    }
-    @media (min-width: 760px){
-      .formGrid{ grid-template-columns: 1fr 1fr; }
-      .formGrid .span2{ grid-column: span 2; }
-    }
-
-    .btnRow{
-      display:grid;
-      grid-template-columns: 1fr 1fr;
-      gap:10px;
-    }
-    .btnRow .span2{ grid-column: span 2; }
-    @media (max-width: 420px){
-      .btnRow{ grid-template-columns: 1fr; }
-      .btnRow .span2{ grid-column: auto; }
-    }
-
-    input, select{
-      height: 44px;
-      padding: 0 12px;
-      border-radius: 12px;
-      border: 1px solid rgba(15,23,42,.18);
-      outline: none;
-      font-size: 14px;
-      background: rgba(255,255,255,.98);
-      font-weight: 850;
-      width: 100%;
-      min-width: 0;
-    }
-    input:focus, select:focus{
-      box-shadow: 0 0 0 4px var(--focus);
-      border-color: rgba(37,99,235,.55);
-    }
-
-    button, a.btn{
-      height: 44px;
-      padding: 0 12px;
-      border-radius: 12px;
-      border: 1px solid rgba(15,23,42,.14);
-      background: rgba(255,255,255,.96);
-      cursor:pointer;
-      font-weight: 950;
-      font-size: 14px;
-      transition: transform .08s ease;
-      text-decoration:none;
-      color: inherit;
-      display:flex;
-      align-items:center;
-      justify-content:center;
-      gap:8px;
-      white-space: nowrap;
-      width: 100%;
-    }
-    button:hover, a.btn:hover{ transform: translateY(-1px); }
-
-    .btn-primary{
-      background: linear-gradient(180deg, rgba(37,99,235,.95), rgba(29,78,216,.95));
-      color: white;
-      border-color: rgba(29,78,216,.25);
-      box-shadow: 0 10px 16px rgba(37,99,235,.14);
-    }
-    .btn-danger{
-      background: rgba(239,68,68,.12);
-      border-color: rgba(239,68,68,.25);
-      color: rgba(127,29,29,.95);
-    }
-    .btn-ghost{
-      background: rgba(15,23,42,.06);
-      border-color: rgba(15,23,42,.10);
-      color: rgba(15,23,42,.85);
-      width:auto;
-      padding: 0 14px;
-    }
-
-    .tables{
-      display:grid;
-      grid-template-columns: 1fr;
-      gap: 12px;
-    }
-    @media (min-width: 980px){
-      .tables{ grid-template-columns: 1fr 1fr; }
-    }
-
-    .tableCard{
-      border-radius: 16px;
-      background: rgba(255,255,255,.88);
-      border: 1px solid rgba(15,23,42,.08);
-      overflow:hidden;
-    }
-
-    /* ✅ header row with Slack logo on the right */
-    .tableTitle{
-      padding: 10px 12px;
-      font-weight: 950;
-      font-size: 12px;
-      color: rgba(15,23,42,.78);
-      background: rgba(15,23,42,.05);
-      border-bottom: 1px solid rgba(15,23,42,.08);
-      text-transform: uppercase;
-      letter-spacing: .04em;
-
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      gap:10px;
-    }
-    .titleLeft{ display:flex; align-items:center; gap:8px; }
-    .slackIcon{
-      display:inline-flex;
-      align-items:center;
-      justify-content:center;
-      width: 22px;
-      height: 22px;
-      border-radius: 8px;
-      background: rgba(255,255,255,.90);
-      border: 1px solid rgba(15,23,42,.10);
-      box-shadow: 0 8px 12px rgba(0,0,0,.06);
-      flex: 0 0 auto;
-    }
-    .slackIcon svg{ width: 14px; height: 14px; display:block; }
-
-    .tableWrap{
-      max-height: 220px;
-      overflow:auto;
-    }
-    @media (min-width: 980px){
-      .tableWrap{
-        max-height: none;
-        overflow: visible;
-      }
-    }
-
-    table{
-      width:100%;
-      border-collapse: collapse;
-      min-width: 420px;
-    }
-    th, td{
-      padding: 10px 10px;
-      font-size: 13px;
-      text-align:left;
-      border-bottom: 1px solid rgba(15,23,42,.08);
-      white-space: nowrap;
-      vertical-align: top;
-      background: rgba(255,255,255,.94);
-    }
-    th{
-      position: sticky;
-      top: 0;
-      z-index: 1;
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: .06em;
-      color: rgba(15,23,42,.65);
-      background: rgba(255,255,255,.98);
-    }
-
-    table.storeTable{
-      min-width: 0 !important;
-      width: 100% !important;
-      table-layout: fixed;
-    }
-    table.storeTable th,
-    table.storeTable td{
-      white-space: normal !important;
-    }
-    table.storeTable th:last-child,
-    table.storeTable td:last-child{
-      text-align: right;
-      width: 90px;
-    }
-
-    /* Admin manage: collapsible + scroll */
-    details.manageDetails{
-      margin-top: 12px;
-      border-radius: 16px;
-      background: rgba(255,255,255,.88);
-      border: 1px solid rgba(15,23,42,.08);
-      overflow:hidden;
-    }
-    details.manageDetails > summary{
-      list-style: none;
-      cursor: pointer;
-      padding: 10px 12px;
-      font-weight: 950;
-      font-size: 12px;
-      color: rgba(15,23,42,.78);
-      background: rgba(15,23,42,.05);
-      border-bottom: 1px solid rgba(15,23,42,.08);
-      text-transform: uppercase;
-      letter-spacing: .04em;
-      user-select:none;
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      gap:10px;
-    }
-    details.manageDetails > summary::-webkit-details-marker{ display:none; }
-    .chev{
-      font-size: 12px;
-      color: rgba(15,23,42,.55);
-      font-weight: 950;
-    }
-    .manageWrap{
-      max-height: 260px;
-      overflow: auto;
-    }
-    @media (max-width: 520px){
-      .manageWrap{ max-height: 320px; }
-    }
-
-    table.manageTable{
-      min-width: 0 !important;
-      width: 100% !important;
-      table-layout: fixed;
-    }
-    table.manageTable td, table.manageTable th{
-      white-space: normal !important;
-    }
-    .mini{
-      height: 38px !important;
-      font-size: 12px !important;
-      font-weight: 850 !important;
-    }
-    .btnSmall{
-      height: 38px !important;
-      font-size: 12px !important;
-      font-weight: 950 !important;
-      padding: 0 10px !important;
-    }
-
-    footer{
-      margin-top: 10px;
-      text-align:center;
-      color: rgba(15,23,42,.55);
-      font-weight: 900;
-      font-size: 12px;
-      padding: 6px 0 2px;
-    }
+    }}
+    .grid{{ display:grid; grid-template-columns: 1fr; gap: 12px; margin-top: 12px; align-items:start; }}
+    @media (min-width: 980px){{ .grid{{ grid-template-columns: 420px 1fr; }} }}
+    .card{{
+      background: var(--card); border: 1px solid var(--border); border-radius: 18px;
+      box-shadow: var(--shadow); backdrop-filter: blur(10px); padding: 12px;
+    }}
+    .jugPanel{{ border-radius: 16px; background: rgba(255,255,255,.88); border: 1px solid rgba(15,23,42,.08); padding: 10px; }}
+    .jugWrap{{ display:flex; flex-direction:column; align-items:center; gap:10px; }}
+    .jugSvg{{ width: min(320px, 100%); height:auto; user-select:none; filter: drop-shadow(0 14px 18px rgba(0,0,0,.16)); }}
+    .kpis{{ display:grid; grid-template-columns: 1fr 1fr 1fr; gap:8px; width: 100%; }}
+    .kpi{{ padding: 10px; border-radius: 14px; background: rgba(255,255,255,.92); border: 1px solid rgba(15,23,42,.08); box-shadow: 0 10px 16px rgba(0,0,0,.06); }}
+    .kpi .label{{ font-size:10px; color: var(--muted); margin-bottom:4px; font-weight:950; text-transform: uppercase; letter-spacing: .06em; }}
+    .kpi .value{{ font-size:18px; font-weight:950; margin:0; }}
+    .flash{{ width:100%; padding: 10px 12px; border-radius: 14px; border: 1px solid rgba(15,23,42,.12); background: rgba(255,255,255,.92); font-weight: 850; font-size: 13px; }}
+    .flash.ok{{ border-color: rgba(34,197,94,.25); background: rgba(34,197,94,.10); }}
+    .flash.bad{{ border-color: rgba(239,68,68,.28); background: rgba(239,68,68,.10); }}
+    .sectionHead{{ display:flex; align-items:center; justify-content:space-between; gap:10px; padding: 10px 10px; border-radius: 14px;
+      background: rgba(15,23,42,.05); border: 1px solid rgba(15,23,42,.08);
+      font-weight: 950; font-size: 12px; color: rgba(15,23,42,.78);
+      text-transform: uppercase; letter-spacing: .04em; margin-bottom: 10px; }}
+    .weekRow{{ display:flex; gap:10px; flex-wrap:wrap; margin-bottom: 12px; align-items:center; }}
+    .weekRow > select{{ flex: 1 1 280px; }}
+    form.controls{{ display:grid; grid-template-columns: 1fr; gap:10px; padding: 10px; border-radius: 16px;
+      background: rgba(255,255,255,.88); border: 1px solid rgba(15,23,42,.08);
+      box-shadow: 0 10px 16px rgba(0,0,0,.06); margin-bottom: 12px; }}
+    .formGrid{{ display:grid; grid-template-columns: 1fr; gap:10px; }}
+    @media (min-width: 760px){{ .formGrid{{ grid-template-columns: 1fr 1fr; }} .formGrid .span2{{ grid-column: span 2; }} }}
+    .btnRow{{ display:grid; grid-template-columns: 1fr 1fr; gap:10px; }}
+    .btnRow .span2{{ grid-column: span 2; }}
+    @media (max-width: 420px){{ .btnRow{{ grid-template-columns: 1fr; }} .btnRow .span2{{ grid-column: auto; }} }}
+    input, select{{ height: 44px; padding: 0 12px; border-radius: 12px; border: 1px solid rgba(15,23,42,.18); outline: none;
+      font-size: 14px; background: rgba(255,255,255,.98); font-weight: 850; width: 100%; min-width: 0; }}
+    input:focus, select:focus{{ box-shadow: 0 0 0 4px var(--focus); border-color: rgba(37,99,235,.55); }}
+    button, a.btn{{ height: 44px; padding: 0 12px; border-radius: 12px; border: 1px solid rgba(15,23,42,.14); background: rgba(255,255,255,.96);
+      cursor:pointer; font-weight: 950; font-size: 14px; transition: transform .08s ease; text-decoration:none; color: inherit;
+      display:flex; align-items:center; justify-content:center; gap:8px; white-space: nowrap; width: 100%; }}
+    button:hover, a.btn:hover{{ transform: translateY(-1px); }}
+    .btn-primary{{ background: linear-gradient(180deg, rgba(37,99,235,.95), rgba(29,78,216,.95)); color: white;
+      border-color: rgba(29,78,216,.25); box-shadow: 0 10px 16px rgba(37,99,235,.14); }}
+    .btn-danger{{ background: rgba(239,68,68,.12); border-color: rgba(239,68,68,.25); color: rgba(127,29,29,.95); }}
+    .btn-ghost{{ background: rgba(15,23,42,.06); border-color: rgba(15,23,42,.10); color: rgba(15,23,42,.85); width:auto; padding: 0 14px; }}
+    .tables{{ display:grid; grid-template-columns: 1fr; gap: 12px; }}
+    @media (min-width: 980px){{ .tables{{ grid-template-columns: 1fr 1fr; }} }}
+    .tableCard{{ border-radius: 16px; background: rgba(255,255,255,.88); border: 1px solid rgba(15,23,42,.08); overflow:hidden; }}
+    .tableTitle{{ padding: 10px 12px; font-weight: 950; font-size: 12px; color: rgba(15,23,42,.78);
+      background: rgba(15,23,42,.05); border-bottom: 1px solid rgba(15,23,42,.08);
+      text-transform: uppercase; letter-spacing: .04em;
+      display:flex; align-items:center; justify-content:space-between; gap:10px; }}
+    .slackIcon{{ display:inline-flex; align-items:center; justify-content:center; width: 24px; height: 24px; border-radius: 8px;
+      background: rgba(255,255,255,.96); border: 1px solid rgba(15,23,42,.10); box-shadow: 0 8px 12px rgba(0,0,0,.06); }}
+    .slackIcon svg{{ width: 16px; height: 16px; display:block; }}
+    .tableWrap{{ max-height: 220px; overflow:auto; }}
+    @media (min-width: 980px){{ .tableWrap{{ max-height: none; overflow: visible; }} }}
+    table{{ width:100%; border-collapse: collapse; min-width: 420px; }}
+    th, td{{ padding: 10px 10px; font-size: 13px; text-align:left; border-bottom: 1px solid rgba(15,23,42,.08);
+      white-space: nowrap; vertical-align: top; background: rgba(255,255,255,.94); }}
+    th{{ position: sticky; top: 0; z-index: 1; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: rgba(15,23,42,.65);
+      background: rgba(255,255,255,.98); }}
+    table.storeTable{{ min-width: 0 !important; width: 100% !important; table-layout: fixed; }}
+    table.storeTable th, table.storeTable td{{ white-space: normal !important; }}
+    table.storeTable th:last-child, table.storeTable td:last-child{{ text-align: right; width: 90px; }}
+    details.manageDetails{{ margin-top: 12px; border-radius: 16px; background: rgba(255,255,255,.88); border: 1px solid rgba(15,23,42,.08); overflow:hidden; }}
+    details.manageDetails > summary{{ list-style: none; cursor: pointer; padding: 10px 12px; font-weight: 950; font-size: 12px;
+      color: rgba(15,23,42,.78); background: rgba(15,23,42,.05); border-bottom: 1px solid rgba(15,23,42,.08);
+      text-transform: uppercase; letter-spacing: .04em; user-select:none; display:flex; align-items:center; justify-content:space-between; gap:10px; }}
+    details.manageDetails > summary::-webkit-details-marker{{ display:none; }}
+    .chev{{ font-size: 12px; color: rgba(15,23,42,.55); font-weight: 950; }}
+    .manageWrap{{ max-height: 260px; overflow: auto; }}
+    @media (max-width: 520px){{ .manageWrap{{ max-height: 320px; }} }}
+    table.manageTable{{ min-width: 0 !important; width: 100% !important; table-layout: fixed; }}
+    table.manageTable td, table.manageTable th{{ white-space: normal !important; }}
+    .mini{{ height: 38px !important; font-size: 12px !important; font-weight: 850 !important; }}
+    .btnSmall{{ height: 38px !important; font-size: 12px !important; font-weight: 950 !important; padding: 0 10px !important; }}
+    footer{{ margin-top: 10px; text-align:center; color: rgba(15,23,42,.55); font-weight: 900; font-size: 12px; padding: 6px 0 2px; }}
   </style>
 </head>
 <body>
@@ -1028,15 +804,15 @@ HTML_PAGE = """
         <div class="logo" aria-hidden="true"></div>
         <div>
           <h1>Primo Sales Tracker</h1>
-          <div class="sub">Logged in as <b>{{ user_rep }}</b>{% if not admin %} (rep){% endif %}</div>
+          <div class="sub">Logged in as <b>{{{{ user_rep }}}}</b>{{% if not admin %}} (rep){{% endif %}}</div>
         </div>
       </div>
 
       <div class="topActions">
-        <div class="pill">Week: <b>{{ range_label }}</b></div>
-        <div class="pill">Total: <b>{{ weekly_sales }}</b></div>
-        <div class="pill">Goal: <b>{{ goal }}</b></div>
-        <a class="logout" href="{{ url_for('logout') }}">Logout</a>
+        <div class="pill">Week: <b>{{{{ range_label }}}}</b></div>
+        <div class="pill">Total: <b>{{{{ weekly_sales }}}}</b></div>
+        <div class="pill">Goal: <b>{{{{ goal }}}}</b></div>
+        <a class="logout" href="{{{{ url_for('logout') }}}}">Logout</a>
       </div>
     </div>
 
@@ -1108,11 +884,11 @@ HTML_PAGE = """
 
               <!-- Water -->
               <g clip-path="url(#jugClip)">
-                <rect x="0" y="{{ water_y }}" width="280" height="{{ water_h }}" fill="url(#waterGrad)"/>
-                {% if fill_percentage > 0 %}
-                  <rect x="0" y="{{ water_y }}" width="280" height="22" fill="url(#waterEdge)" opacity="0.8"/>
-                  <ellipse cx="140" cy="{{ water_y + 6 }}" rx="150" ry="10" fill="rgba(255,255,255,0.14)" opacity="0.85"/>
-                {% endif %}
+                <rect x="0" y="{{{{ water_y }}}}" width="280" height="{{{{ water_h }}}}" fill="url(#waterGrad)"/>
+                {{% if fill_percentage > 0 %}}
+                  <rect x="0" y="{{{{ water_y }}}}" width="280" height="22" fill="url(#waterEdge)" opacity="0.8"/>
+                  <ellipse cx="140" cy="{{{{ water_y + 6 }}}}" rx="150" ry="10" fill="rgba(255,255,255,0.14)" opacity="0.85"/>
+                {{% endif %}}
               </g>
 
               <!-- Jug body -->
@@ -1170,23 +946,14 @@ HTML_PAGE = """
             </svg>
 
             <div class="kpis">
-              <div class="kpi">
-                <div class="label">Sold</div>
-                <p class="value">{{ weekly_sales }}</p>
-              </div>
-              <div class="kpi">
-                <div class="label">Remaining</div>
-                <p class="value">{{ remaining }}</p>
-              </div>
-              <div class="kpi">
-                <div class="label">Complete</div>
-                <p class="value">{{ fill_percentage | round(0) }}%</p>
-              </div>
+              <div class="kpi"><div class="label">Sold</div><p class="value">{{{{ weekly_sales }}}}</p></div>
+              <div class="kpi"><div class="label">Remaining</div><p class="value">{{{{ remaining }}}}</p></div>
+              <div class="kpi"><div class="label">Complete</div><p class="value">{{{{ fill_percentage | round(0) }}}}%</p></div>
             </div>
 
-            {% if message %}
-              <div class="flash {{ 'ok' if ok else 'bad' }}">{{ message }}</div>
-            {% endif %}
+            {{% if message %}}
+              <div class="flash {{{{ 'ok' if ok else 'bad' }}}}">{{{{ message }}}}</div>
+            {{% endif %}}
           </div>
         </div>
       </div>
@@ -1196,43 +963,40 @@ HTML_PAGE = """
         <div class="sectionHead">Sales</div>
 
         <div class="weekRow">
-          <form method="GET" action="{{ url_for('index') }}" style="margin:0; display:flex; gap:10px; flex-wrap:wrap; width:100%;">
+          <form method="GET" action="{{{{ url_for('index') }}}}" style="margin:0; display:flex; gap:10px; flex-wrap:wrap; width:100%;">
             <select name="week">
-              <option value="{{ selected_week_start }}" selected>Viewing: {{ range_label }}</option>
-              <option value="{{ current_week_start }}">Current Week ({{ current_range_label }})</option>
-              {% for wk in weeks %}
-                {% if wk != selected_week_start and wk != current_week_start %}
-                  <option value="{{ wk }}">{{ wk }}</option>
-                {% endif %}
-              {% endfor %}
+              <option value="{{{{ selected_week_start }}}}" selected>Viewing: {{{{ range_label }}}}</option>
+              <option value="{{{{ current_week_start }}}}">Current Week ({{{{ current_range_label }}}})</option>
+              {{% for wk in weeks %}}
+                {{% if wk != selected_week_start and wk != current_week_start %}}
+                  <option value="{{{{ wk }}}}">{{{{ wk }}}}</option>
+                {{% endif %}}
+              {{% endfor %}}
             </select>
             <button class="btn-ghost" type="submit" style="flex:0 0 auto;">View</button>
           </form>
         </div>
 
-        {% if admin %}
-          <!-- ADMIN ONLY: manual add / undo / reset / export -->
+        {{% if admin %}}
           <form method="POST" id="salesForm" class="controls" autocomplete="off">
-            <input type="hidden" name="week" value="{{ selected_week_start }}">
+            <input type="hidden" name="week" value="{{{{ selected_week_start }}}}">
 
             <div class="formGrid">
               <div>
                 <select name="rep">
-                  {% for r in reps %}
-                    <option value="{{ r }}" {% if r == user_rep %}selected{% endif %}>{{ r }}</option>
-                  {% endfor %}
+                  {{% for r in reps %}}
+                    <option value="{{{{ r }}}}" {{% if r == user_rep %}}selected{{% endif %}}>{{{{ r }}}}</option>
+                  {{% endfor %}}
                 </select>
               </div>
-
               <div>
                 <input type="number" id="salesInput" name="sales" placeholder="Quantity" min="1" step="1" required>
               </div>
-
               <div class="span2">
                 <select name="store_location" required>
-                  {% for s in stores %}
-                    <option value="{{ s }}">{{ s }}</option>
-                  {% endfor %}
+                  {{% for s in stores %}}
+                    <option value="{{{{ s }}}}">{{{{ s }}}}</option>
+                  {{% endfor %}}
                 </select>
               </div>
             </div>
@@ -1242,100 +1006,66 @@ HTML_PAGE = """
               <button type="submit" name="action" value="undo">Undo</button>
               <button type="submit" name="action" value="reset" class="btn-danger"
                       onclick="return confirm('Reset this week\\'s total to 0?');">Reset</button>
-              <a class="btn span2" href="{{ url_for('export_csv', week=selected_week_start) }}">Export CSV</a>
+              <a class="btn span2" href="{{{{ url_for('export_csv', week=selected_week_start) }}}}">Export CSV</a>
             </div>
           </form>
-        {% else %}
-          <!-- NON-ADMIN: no green box + no manual add -->
-          <a class="btn" href="{{ url_for('export_csv', week=selected_week_start) }}">Export CSV</a>
-        {% endif %}
+        {{% else %}}
+          <a class="btn" href="{{{{ url_for('export_csv', week=selected_week_start) }}}}">Export CSV</a>
+        {{% endif %}}
 
         <div class="tables" style="margin-top: 12px;">
-          <!-- BOX 1: Leaderboard -->
           <div class="tableCard">
             <div class="tableTitle">
-              <div class="titleLeft">Leaderboard</div>
-              <div class="slackIcon" title="Auto-updates from Slack" aria-label="Slack">
-                <!-- simple Slack-ish 4-dot icon -->
-                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                  <path d="M7.5 14.5a2 2 0 1 1-2-2h2v2Z" fill="#E01E5A"/>
-                  <path d="M8.5 14.5a2 2 0 1 1 2-2v2h-2Z" fill="#E01E5A"/>
-                  <path d="M9.5 7.5a2 2 0 1 1 2-2v2h-2Z" fill="#36C5F0"/>
-                  <path d="M9.5 8.5a2 2 0 1 1 2 2h-2v-2Z" fill="#36C5F0"/>
-                  <path d="M16.5 9.5a2 2 0 1 1 2 2h-2v-2Z" fill="#2EB67D"/>
-                  <path d="M15.5 9.5a2 2 0 1 1-2 2v-2h2Z" fill="#2EB67D"/>
-                  <path d="M14.5 16.5a2 2 0 1 1-2 2v-2h2Z" fill="#ECB22E"/>
-                  <path d="M14.5 15.5a2 2 0 1 1 2-2v2h-2Z" fill="#ECB22E"/>
-                </svg>
-              </div>
+              <div>Leaderboard</div>
+              <div class="slackIcon" title="Auto-updates from Slack" aria-label="Slack">{SLACK_SVG}</div>
             </div>
             <div class="tableWrap">
               <table>
-                <thead>
-                  <tr><th>Rep</th><th>Total</th></tr>
-                </thead>
+                <thead><tr><th>Rep</th><th>Total</th></tr></thead>
                 <tbody>
-                  {% if rep_rows %}
-                    {% for rep, total, today_total in rep_rows %}
+                  {{% if rep_rows %}}
+                    {{% for rep, total, today_total in rep_rows %}}
                       <tr>
-                        <td>{{ rep }}</td>
+                        <td>{{{{ rep }}}}</td>
                         <td>
-                          <b>{{ total }}</b>
+                          <b>{{{{ total }}}}</b>
                           <span style="color: rgba(15,23,42,.62); font-weight: 900;">
-                            &nbsp;&nbsp;+{{ today_total }}
+                            &nbsp;&nbsp;+{{{{ today_total }}}}
                           </span>
                         </td>
                       </tr>
-                    {% endfor %}
-                  {% else %}
+                    {{% endfor %}}
+                  {{% else %}}
                     <tr><td colspan="2" style="color: rgba(15,23,42,.60); font-weight: 900;">No entries yet</td></tr>
-                  {% endif %}
+                  {{% endif %}}
                 </tbody>
               </table>
             </div>
           </div>
 
-          <!-- BOX 2: Store production -->
           <div class="tableCard">
             <div class="tableTitle">
-              <div class="titleLeft">Store production</div>
-              <div class="slackIcon" title="Auto-updates from Slack" aria-label="Slack">
-                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                  <path d="M7.5 14.5a2 2 0 1 1-2-2h2v2Z" fill="#E01E5A"/>
-                  <path d="M8.5 14.5a2 2 0 1 1 2-2v2h-2Z" fill="#E01E5A"/>
-                  <path d="M9.5 7.5a2 2 0 1 1 2-2v2h-2Z" fill="#36C5F0"/>
-                  <path d="M9.5 8.5a2 2 0 1 1 2 2h-2v-2Z" fill="#36C5F0"/>
-                  <path d="M16.5 9.5a2 2 0 1 1 2 2h-2v-2Z" fill="#2EB67D"/>
-                  <path d="M15.5 9.5a2 2 0 1 1-2 2v-2h2Z" fill="#2EB67D"/>
-                  <path d="M14.5 16.5a2 2 0 1 1-2 2v-2h2Z" fill="#ECB22E"/>
-                  <path d="M14.5 15.5a2 2 0 1 1 2-2v2h-2Z" fill="#ECB22E"/>
-                </svg>
-              </div>
+              <div>Store production</div>
+              <div class="slackIcon" title="Auto-updates from Slack" aria-label="Slack">{SLACK_SVG}</div>
             </div>
             <div class="tableWrap">
               <table class="storeTable">
-                <thead>
-                  <tr><th>Store</th><th>Week</th></tr>
-                </thead>
+                <thead><tr><th>Store</th><th>Week</th></tr></thead>
                 <tbody>
-                  {% if store_rows %}
-                    {% for store, total in store_rows %}
-                      <tr>
-                        <td>{{ store }}</td>
-                        <td><b>{{ total }}</b></td>
-                      </tr>
-                    {% endfor %}
-                  {% else %}
+                  {{% if store_rows %}}
+                    {{% for store, total in store_rows %}}
+                      <tr><td>{{{{ store }}}}</td><td><b>{{{{ total }}}}</b></td></tr>
+                    {{% endfor %}}
+                  {{% else %}}
                     <tr><td colspan="2" style="color: rgba(15,23,42,.60); font-weight: 900;">No entries yet</td></tr>
-                  {% endif %}
+                  {{% endif %}}
                 </tbody>
               </table>
             </div>
           </div>
         </div>
 
-        {% if admin %}
-          <!-- ADMIN ONLY: Manage Entries collapsible -->
+        {{% if admin %}}
           <details class="manageDetails">
             <summary>
               Admin — manage entries (edit/delete)
@@ -1355,66 +1085,65 @@ HTML_PAGE = """
                   </tr>
                 </thead>
                 <tbody>
-                  {% if recent %}
-                    {% for e in recent %}
+                  {{% if recent %}}
+                    {{% for e in recent %}}
                       <tr>
-                        <td>{{ e.id }}</td>
-                        <td>{{ e.rep }}</td>
+                        <td>{{{{ e.id }}}}</td>
+                        <td>{{{{ e.rep }}}}</td>
                         <td>
-                          <form method="POST" action="{{ url_for('admin_update') }}" style="display:flex; gap:8px; align-items:center; margin:0;">
-                            <input type="hidden" name="week" value="{{ selected_week_start }}">
-                            <input type="hidden" name="entry_id" value="{{ e.id }}">
-                            <input class="mini" type="number" name="qty" value="{{ e.qty }}" min="1" step="1" style="max-width: 90px;">
+                          <form method="POST" action="{{{{ url_for('admin_update') }}}}" style="display:flex; gap:8px; align-items:center; margin:0;">
+                            <input type="hidden" name="week" value="{{{{ selected_week_start }}}}">
+                            <input type="hidden" name="entry_id" value="{{{{ e.id }}}}">
+                            <input class="mini" type="number" name="qty" value="{{{{ e.qty }}}}" min="1" step="1" style="max-width: 90px;">
                         </td>
                         <td>
                             <select class="mini" name="store" style="max-width: 320px;">
-                              {% set current = (e.store or '') %}
-                              <option value="Slack" {% if current == 'Slack' %}selected{% endif %}>Slack</option>
-                              {% for s in stores %}
-                                <option value="{{ s }}" {% if current == s %}selected{% endif %}>{{ s }}</option>
-                              {% endfor %}
+                              {{% set current = (e.store or '') %}}
+                              <option value="Slack" {{% if current == 'Slack' %}}selected{{% endif %}}>Slack</option>
+                              {{% for s in stores %}}
+                                <option value="{{{{ s }}}}" {{% if current == s %}}selected{{% endif %}}>{{{{ s }}}}</option>
+                              {{% endfor %}}
                             </select>
                         </td>
-                        <td>{{ e.created_at }}</td>
+                        <td>{{{{ e.created_at }}}}</td>
                         <td>
                             <button class="btnSmall btn-primary" type="submit">Save</button>
                           </form>
-                          <form method="POST" action="{{ url_for('admin_delete') }}" style="display:inline; margin:0;">
-                            <input type="hidden" name="week" value="{{ selected_week_start }}">
-                            <input type="hidden" name="entry_id" value="{{ e.id }}">
+                          <form method="POST" action="{{{{ url_for('admin_delete') }}}}" style="display:inline; margin:0;">
+                            <input type="hidden" name="week" value="{{{{ selected_week_start }}}}">
+                            <input type="hidden" name="entry_id" value="{{{{ e.id }}}}">
                             <button class="btnSmall btn-danger" type="submit"
-                                    onclick="return confirm('Delete entry #{{ e.id }}?');">Delete</button>
+                                    onclick="return confirm('Delete entry #{{{{ e.id }}}}?');">Delete</button>
                           </form>
                         </td>
                       </tr>
-                    {% endfor %}
-                  {% else %}
+                    {{% endfor %}}
+                  {{% else %}}
                     <tr><td colspan="6" style="color: rgba(15,23,42,.60); font-weight: 900;">No entries yet</td></tr>
-                  {% endif %}
+                  {{% endif %}}
                 </tbody>
               </table>
             </div>
           </details>
-        {% endif %}
+        {{% endif %}}
 
-        <footer>{{ version }}</footer>
+        <footer>{{{{ version }}}}</footer>
       </div>
     </div>
   </div>
 
   <script>
-  (function(){
+  (function(){{
     const form = document.getElementById('salesForm');
     const input = document.getElementById('salesInput');
     if (!form || !input) return;
-
-    form.addEventListener('click', (e) => {
+    form.addEventListener('click', (e) => {{
       const btn = e.target.closest('button');
       if (!btn) return;
       input.required = (btn.value === 'add');
       if (btn.value === 'add') input.focus();
-    });
-  })();
+    }});
+  }})();
   </script>
 </body>
 </html>
@@ -1477,7 +1206,6 @@ def index():
     if request.method == "POST":
         action = request.form.get("action", "")
 
-        # Non-admin cannot mutate data from the UI
         if not admin:
             message = "Sales are pulled from Slack."
             ok = False
@@ -1511,7 +1239,6 @@ def index():
             except Exception:
                 message = "For Add: enter a valid whole number > 0 and choose a store location."
                 ok = False
-
         else:
             message = "Unknown action."
             ok = False
@@ -1655,61 +1382,92 @@ def export_csv():
 # ---------------- SLACK EVENTS ----------------
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
-    raw = request.get_data(as_text=True) or ""
-    try:
-        payload = json.loads(raw) if raw else {}
-    except Exception:
-        payload = {}
+    # Parse JSON safely
+    payload = request.get_json(silent=True) or {}
 
     # Slack URL verification
     if payload.get("type") == "url_verification":
         return jsonify({"challenge": payload.get("challenge", "")})
 
-    # Verify signature
+    # Verify signature for real events
     if not slack_verify_request(request):
         return Response("invalid signature", status=403)
 
-    # Ensure DB after signature
+    # Ensure DB ready
     global _db_ready
     if not _db_ready:
         init_db()
         _db_ready = True
 
-    # De-dupe
     event_id = payload.get("event_id", "")
-    if event_id and slack_event_already_processed(event_id):
+    if slack_event_already_processed(event_id):
         return Response("ok", status=200)
 
     event = payload.get("event", {}) or {}
-    if event.get("type") != "message":
-        return Response("ok", status=200)
-
-    # Ignore bot/edited/system messages
-    if event.get("subtype"):
-        return Response("ok", status=200)
+    channel_id = (event.get("channel") or "").strip()
 
     # Only count from your specific channel
-    if SLACK_CHANNEL_ID and event.get("channel") != SLACK_CHANNEL_ID:
+    if SLACK_CHANNEL_ID and channel_id != SLACK_CHANNEL_ID:
+        mark_slack_event_processed(event_id)
+        return Response("ok", status=200)
+
+    subtype = event.get("subtype")
+
+    # ✅ Ignore edits entirely
+    if subtype == "message_changed":
+        mark_slack_event_processed(event_id)
+        return Response("ok", status=200)
+
+    # ✅ If a message was deleted: remove the sale IF it was previously counted
+    if subtype == "message_deleted":
+        deleted_ts = (event.get("deleted_ts") or "").strip()
+        # Sometimes Slack also includes previous_message
+        if not deleted_ts:
+            prev = event.get("previous_message") or {}
+            deleted_ts = (prev.get("ts") or "").strip()
+
+        if deleted_ts:
+            remove_sale_from_slack(channel_id, deleted_ts)
+
+        mark_slack_event_processed(event_id)
+        return Response("ok", status=200)
+
+    # Only handle new messages (top-level posts)
+    if event.get("type") != "message":
+        mark_slack_event_processed(event_id)
+        return Response("ok", status=200)
+
+    # Ignore any other subtypes (bot_message, etc.)
+    if subtype:
+        mark_slack_event_processed(event_id)
         return Response("ok", status=200)
 
     user = (event.get("user") or "").strip()
     text = (event.get("text") or "")
+    ts = (event.get("ts") or "").strip()
 
-    # Only Tristan/Ricky/Sohaib
+    # ✅ Only Tristan/Ricky/Sohaib
     rep = SLACK_USER_TO_REP.get(user)
     if not rep:
+        mark_slack_event_processed(event_id)
         return Response("ok", status=200)
 
-    # Must contain "water" (case-insensitive)
+    # ✅ Only count if contains "water"
     if "water" not in text.lower():
+        mark_slack_event_processed(event_id)
+        return Response("ok", status=200)
+
+    # ✅ Only count if it is a top-level post (NOT a comment/thread reply)
+    # Thread replies have thread_ts != ts
+    thread_ts = (event.get("thread_ts") or "").strip()
+    if thread_ts and thread_ts != ts:
+        mark_slack_event_processed(event_id)
         return Response("ok", status=200)
 
     wk_start = get_week_start(local_today())
-    add_entry_from_slack(wk_start, rep, 1)
+    add_sale_from_slack(wk_start, rep, channel_id, ts, qty=1)
 
-    if event_id:
-        mark_slack_event_processed(event_id)
-
+    mark_slack_event_processed(event_id)
     return Response("ok", status=200)
 
 
@@ -1736,8 +1494,7 @@ def db_status():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
+    init_db()
     app.run(host="0.0.0.0", port=port)
-
-
 
 
