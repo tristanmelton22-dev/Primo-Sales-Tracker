@@ -107,7 +107,7 @@ def db_conn():
 def init_db():
     with db_conn() as conn:
         with conn.cursor() as cur:
-            # sales_entries stores BOTH manual and slack-driven entries
+            # 1) Create the table if it doesn't exist (fresh installs)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS sales_entries (
                     id BIGSERIAL PRIMARY KEY,
@@ -115,26 +115,27 @@ def init_db():
                     rep TEXT NOT NULL,
                     qty INTEGER NOT NULL,
                     created_at DATE NOT NULL,
-                    store_location TEXT NOT NULL DEFAULT '',
-                    slack_channel TEXT NOT NULL DEFAULT '',
-                    slack_ts TEXT NOT NULL DEFAULT ''
+                    store_location TEXT NOT NULL DEFAULT ''
                 );
             """)
-            # Uniqueness to allow delete by Slack message id
+
+            # 2) If the table already existed from older versions, add missing columns safely
+            cur.execute("ALTER TABLE sales_entries ADD COLUMN IF NOT EXISTS store_location TEXT NOT NULL DEFAULT '';")
+            cur.execute("ALTER TABLE sales_entries ADD COLUMN IF NOT EXISTS slack_channel TEXT NOT NULL DEFAULT '';")
+            cur.execute("ALTER TABLE sales_entries ADD COLUMN IF NOT EXISTS slack_ts TEXT NOT NULL DEFAULT '';")
+
+            # 3) Indexes
             cur.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS ux_sales_slack_msg
                 ON sales_entries (slack_channel, slack_ts)
                 WHERE slack_channel <> '' AND slack_ts <> '';
             """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_sales_week ON sales_entries(week_start);
-            """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_sales_week_rep ON sales_entries(week_start, rep);
-            """)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_sales_week_created ON sales_entries(week_start, created_at);
-            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_week ON sales_entries(week_start);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_week_rep ON sales_entries(week_start, rep);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_week_created ON sales_entries(week_start, created_at);")
+
+        conn.commit()
+
 
 # ---------------- App helpers ----------------
 _db_ready = False
@@ -1370,6 +1371,7 @@ if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
