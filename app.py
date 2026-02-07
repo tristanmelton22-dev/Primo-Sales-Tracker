@@ -1,11 +1,15 @@
 from flask import (
     Flask, request, render_template_string, redirect, url_for,
-    Response, session, abort
+    Response, session, abort, jsonify
 )
 from datetime import date, timedelta, datetime, timezone
 import os
 import csv
 import io
+import json
+import time
+import hmac
+import hashlib
 
 # Python 3.9+ zoneinfo, but some Windows installs can be missing tzdata.
 try:
@@ -14,7 +18,7 @@ except Exception:
     ZoneInfo = None
 
 # Postgres driver (psycopg v3)
-# requirements.txt: psycopg[binary]
+# requirements.txt MUST include: psycopg[binary]
 try:
     import psycopg
 except Exception as e:
@@ -53,18 +57,34 @@ if not DATABASE_URL:
     raise RuntimeError(
         "DATABASE_URL is missing. On Render: Service → Environment → add DATABASE_URL with your Postgres connection string."
     )
-# ---------------------------------------
+
+# ---------------- SLACK CONFIG ----------------
+# You set these in Render → Environment
+SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET", "").strip()
+SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "").strip()
+
+# Put each person's Slack member ID in Render env vars:
+# SLACK_TRISTAN_ID, SLACK_RICKY_ID, SLACK_SOHAIB_ID
+SLACK_TRISTAN_ID = os.environ.get("SLACK_TRISTAN_ID", "").strip()
+SLACK_RICKY_ID = os.environ.get("SLACK_RICKY_ID", "").strip()
+SLACK_SOHAIB_ID = os.environ.get("SLACK_SOHAIB_ID", "").strip()
+
+SLACK_USER_TO_REP = {
+    SLACK_TRISTAN_ID: "Tristan",
+    SLACK_RICKY_ID: "Ricky",
+    SLACK_SOHAIB_ID: "Sohaib",
+}
+SLACK_USER_TO_REP = {k: v for k, v in SLACK_USER_TO_REP.items() if k}
+# ---------------------------------------------
 
 
 # -------- Timezone (Central, safe fallback) --------
 def get_central_tz():
-    # Best: DST-aware IANA TZ
     if ZoneInfo is not None:
         try:
             return ZoneInfo("America/Chicago")
         except Exception:
             pass
-    # Fallback: fixed CST offset (no DST) but prevents crash
     return timezone(timedelta(hours=-6))
 
 
@@ -72,7 +92,6 @@ TZ = get_central_tz()
 
 
 def local_today() -> date:
-    # Central date (so “today” and the +amount reset correctly overnight)
     return datetime.now(TZ).date()
 
 
@@ -94,6 +113,12 @@ def init_db():
                     note TEXT NOT NULL DEFAULT ''
                 );
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS slack_processed_events (
+                    event_id TEXT PRIMARY KEY,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week ON sales_entries(week_start);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week_rep ON sales_entries(week_start, rep);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week_created ON sales_entries(week_start, created_at);")
@@ -105,7 +130,14 @@ _db_ready = False
 
 @app.before_request
 def ensure_db():
+    """
+    Slack verifies your URL by sending a challenge.
+    We do NOT want the app to fail verification because the DB is slow/unreachable.
+    So we skip DB init for /slack/events.
+    """
     global _db_ready
+    if request.path.startswith("/slack/events"):
+        return
     if not _db_ready:
         init_db()
         _db_ready = True
@@ -177,12 +209,11 @@ def week_total(week_start: date) -> int:
 
 def rep_totals_with_today(week_start: date, today_central: date) -> list[tuple[str, int, int]]:
     """
-    Returns list of (rep, week_total, today_total) for the selected week.
-    - today_total is ONLY qty submitted on today's Central date and resets automatically tomorrow.
+    Returns list of (rep, week_total, today_total)
+    today_total is ONLY qty submitted on today's Central date and resets automatically tomorrow.
     """
     with db_conn() as conn:
         with conn.cursor() as cur:
-            # Week totals
             cur.execute(
                 "SELECT rep, COALESCE(SUM(qty), 0) "
                 "FROM sales_entries WHERE week_start = %s "
@@ -191,7 +222,6 @@ def rep_totals_with_today(week_start: date, today_central: date) -> list[tuple[s
             )
             week_rows = cur.fetchall()
 
-            # Today's totals (Central date)
             cur.execute(
                 "SELECT rep, COALESCE(SUM(qty), 0) "
                 "FROM sales_entries WHERE week_start = %s AND created_at = %s "
@@ -214,8 +244,7 @@ def rep_totals_with_today(week_start: date, today_central: date) -> list[tuple[s
 def store_totals_for_week(week_start: date) -> list[tuple[str, int]]:
     """
     Store production: weekly totals per store.
-    IMPORTANT: always returns ALL known stores with a number (0 if none),
-    so every row shows a value.
+    Always returns ALL 4 stores with a number (0 if none).
     """
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -234,11 +263,31 @@ def store_totals_for_week(week_start: date) -> list[tuple[str, int]]:
         if store:
             totals[store] = int(total or 0)
 
-    # Ensure every known store is present, even if 0
     out = [(s, totals.get(s, 0)) for s in STORE_LOCATIONS]
-
-    # Sort by weekly total desc
     out.sort(key=lambda x: (-x[1], x[0].lower()))
+    return out
+
+
+def recent_entries(week_start: date, limit: int = 12) -> list[dict]:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, rep, qty, created_at, COALESCE(note,'') "
+                "FROM sales_entries WHERE week_start = %s "
+                "ORDER BY id DESC LIMIT %s;",
+                (week_start, limit)
+            )
+            rows = cur.fetchall()
+
+    out = []
+    for entry_id, rep, qty, created_at, note in rows:
+        out.append({
+            "id": int(entry_id),
+            "rep": rep,
+            "qty": int(qty),
+            "created_at": created_at.isoformat(),
+            "store": (note or ""),
+        })
     return out
 
 
@@ -267,6 +316,58 @@ def add_entry(week_start: date, rep: str, qty: int, store_location: str):
         conn.commit()
 
 
+def add_entry_from_slack(week_start: date, rep: str, qty: int):
+    """
+    Slack posts add +1 when message contains 'water'.
+    Store is not provided, so we use note='Slack'.
+    Store Production totals stay based on the 4 known stores.
+    """
+    qty = int(qty)
+    if qty <= 0:
+        raise ValueError("qty must be positive")
+
+    rep = (rep or "").strip() or DEFAULT_REP
+    if rep not in REPS:
+        raise ValueError("invalid rep")
+
+    created_date = local_today()
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO sales_entries (week_start, rep, qty, created_at, note) "
+                "VALUES (%s, %s, %s, %s, %s);",
+                (week_start, rep, qty, created_date, "Slack")
+            )
+        conn.commit()
+
+
+def delete_entry(entry_id: int):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM sales_entries WHERE id = %s;", (int(entry_id),))
+        conn.commit()
+
+
+def update_entry(entry_id: int, qty: int, store_location: str):
+    qty = int(qty)
+    if qty <= 0:
+        raise ValueError("qty must be positive")
+
+    store_location = (store_location or "").strip()
+    # Allow keeping Slack rows as Slack; admin can also set to a real store.
+    if store_location != "Slack" and store_location not in STORE_LOCATIONS:
+        raise ValueError("invalid store")
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE sales_entries SET qty = %s, note = %s WHERE id = %s;",
+                (qty, store_location, int(entry_id))
+            )
+        conn.commit()
+
+
 def undo_last_entry(week_start: date):
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -288,6 +389,51 @@ def reset_week(week_start: date):
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM sales_entries WHERE week_start = %s;", (week_start,))
+        conn.commit()
+
+
+# ---------------- Slack helpers ----------------
+def slack_verify_request(req) -> bool:
+    if not SLACK_SIGNING_SECRET:
+        return False
+
+    ts = req.headers.get("X-Slack-Request-Timestamp", "")
+    sig = req.headers.get("X-Slack-Signature", "")
+    if not ts or not sig:
+        return False
+
+    try:
+        ts_int = int(ts)
+    except ValueError:
+        return False
+    if abs(time.time() - ts_int) > 60 * 5:
+        return False
+
+    body = req.get_data(as_text=True)
+    base = f"v0:{ts}:{body}".encode("utf-8")
+    my_sig = "v0=" + hmac.new(
+        SLACK_SIGNING_SECRET.encode("utf-8"),
+        base,
+        hashlib.sha256
+    ).hexdigest()
+
+    return hmac.compare_digest(my_sig, sig)
+
+
+def slack_event_already_processed(event_id: str) -> bool:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM slack_processed_events WHERE event_id = %s;", (event_id,))
+            return cur.fetchone() is not None
+
+
+def mark_slack_event_processed(event_id: str):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO slack_processed_events (event_id) VALUES (%s) ON CONFLICT DO NOTHING;",
+                (event_id,)
+            )
         conn.commit()
 
 
@@ -755,12 +901,10 @@ HTML_PAGE = """
       letter-spacing: .04em;
     }
 
-    /* Mobile: internal scroll if needed */
     .tableWrap{
       max-height: 220px;
       overflow:auto;
     }
-    /* Desktop: no internal scroll */
     @media (min-width: 980px){
       .tableWrap{
         max-height: none;
@@ -793,20 +937,40 @@ HTML_PAGE = """
       background: rgba(255,255,255,.98);
     }
 
-    /* --- Store Production table: always show the numbers column (no horizontal hiding) --- */
     table.storeTable{
-      min-width: 0 !important;   /* override global min-width */
+      min-width: 0 !important;
       width: 100% !important;
-      table-layout: fixed;       /* forces both columns to fit */
+      table-layout: fixed;
     }
     table.storeTable th,
     table.storeTable td{
-      white-space: normal !important; /* override global nowrap */
+      white-space: normal !important;
     }
     table.storeTable th:last-child,
     table.storeTable td:last-child{
       text-align: right;
-      width: 90px;               /* reserves space for the number */
+      width: 90px;
+    }
+
+    /* Admin manage table */
+    table.manageTable{
+      min-width: 0 !important;
+      width: 100% !important;
+      table-layout: fixed;
+    }
+    table.manageTable td, table.manageTable th{
+      white-space: normal !important;
+    }
+    .mini{
+      height: 38px !important;
+      font-size: 12px !important;
+      font-weight: 850 !important;
+    }
+    .btnSmall{
+      height: 38px !important;
+      font-size: 12px !important;
+      font-weight: 950 !important;
+      padding: 0 10px !important;
     }
 
     footer{
@@ -991,7 +1155,7 @@ HTML_PAGE = """
 
       <!-- RIGHT -->
       <div class="card">
-        <div class="sectionHead">Sales entry</div>
+        <div class="sectionHead">Sales</div>
 
         <div class="weekRow">
           <form method="GET" action="{{ url_for('index') }}" style="margin:0; display:flex; gap:10px; flex-wrap:wrap; width:100%;">
@@ -1008,44 +1172,51 @@ HTML_PAGE = """
           </form>
         </div>
 
-        <form method="POST" id="salesForm" class="controls" autocomplete="off">
-          <input type="hidden" name="week" value="{{ selected_week_start }}">
+        {% if admin %}
+          <!-- ADMIN ONLY: manual add / undo / reset / export -->
+          <div class="sectionHead" style="margin-top: 2px;">Admin controls</div>
+          <form method="POST" id="salesForm" class="controls" autocomplete="off">
+            <input type="hidden" name="week" value="{{ selected_week_start }}">
 
-          <div class="formGrid">
-            <div>
-              <select name="rep" disabled>
-                <option value="{{ user_rep }}" selected>{{ user_rep }}</option>
-              </select>
-              <input type="hidden" name="rep" value="{{ user_rep }}">
+            <div class="formGrid">
+              <div>
+                <select name="rep">
+                  {% for r in reps %}
+                    <option value="{{ r }}" {% if r == user_rep %}selected{% endif %}>{{ r }}</option>
+                  {% endfor %}
+                </select>
+              </div>
+
+              <div>
+                <input type="number" id="salesInput" name="sales" placeholder="Quantity" min="1" step="1" required>
+              </div>
+
+              <div class="span2">
+                <select name="store_location" required>
+                  {% for s in stores %}
+                    <option value="{{ s }}">{{ s }}</option>
+                  {% endfor %}
+                </select>
+              </div>
             </div>
 
-            <div>
-              <input type="number" id="salesInput" name="sales" placeholder="Quantity" min="1" step="1">
-            </div>
-
-            <div class="span2">
-              <select name="store_location" required>
-                {% for s in stores %}
-                  <option value="{{ s }}">{{ s }}</option>
-                {% endfor %}
-              </select>
-            </div>
-          </div>
-
-          <div class="btnRow">
-            <button type="submit" name="action" value="add" class="btn-primary span2">Add Sale</button>
-
-            {% if admin %}
+            <div class="btnRow">
+              <button type="submit" name="action" value="add" class="btn-primary span2">Add Sale</button>
               <button type="submit" name="action" value="undo">Undo</button>
               <button type="submit" name="action" value="reset" class="btn-danger"
                       onclick="return confirm('Reset this week\\'s total to 0?');">Reset</button>
-            {% endif %}
-
-            <a class="btn span2" href="{{ url_for('export_csv', week=selected_week_start) }}">Export CSV</a>
+              <a class="btn span2" href="{{ url_for('export_csv', week=selected_week_start) }}">Export CSV</a>
+            </div>
+          </form>
+        {% else %}
+          <!-- NON-ADMIN: no manual add -->
+          <div class="flash ok" style="margin-bottom: 12px;">
+            Sales auto-update from Slack. To add/remove/edit manually, log in as <b>Tristan</b>.
           </div>
-        </form>
+          <a class="btn" href="{{ url_for('export_csv', week=selected_week_start) }}">Export CSV</a>
+        {% endif %}
 
-        <div class="tables">
+        <div class="tables" style="margin-top: 12px;">
           <!-- BOX 1: Leaderboard -->
           <div class="tableCard">
             <div class="tableTitle">Leaderboard</div>
@@ -1075,7 +1246,7 @@ HTML_PAGE = """
             </div>
           </div>
 
-          <!-- BOX 2: Store production (weekly totals per store) -->
+          <!-- BOX 2: Store production -->
           <div class="tableCard">
             <div class="tableTitle">Store production</div>
             <div class="tableWrap">
@@ -1100,6 +1271,65 @@ HTML_PAGE = """
           </div>
         </div>
 
+        {% if admin %}
+          <!-- ADMIN ONLY: Edit / Delete recent entries -->
+          <div class="tableCard" style="margin-top: 12px;">
+            <div class="tableTitle">Admin — manage entries (edit/delete)</div>
+            <div class="tableWrap">
+              <table class="manageTable">
+                <thead>
+                  <tr>
+                    <th style="width: 70px;">ID</th>
+                    <th style="width: 120px;">Rep</th>
+                    <th style="width: 90px;">Qty</th>
+                    <th>Store/Source</th>
+                    <th style="width: 120px;">Date</th>
+                    <th style="width: 170px;">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% if recent %}
+                    {% for e in recent %}
+                      <tr>
+                        <td>{{ e.id }}</td>
+                        <td>{{ e.rep }}</td>
+                        <td>
+                          <form method="POST" action="{{ url_for('admin_update') }}" style="display:flex; gap:8px; align-items:center; margin:0;">
+                            <input type="hidden" name="week" value="{{ selected_week_start }}">
+                            <input type="hidden" name="entry_id" value="{{ e.id }}">
+                            <input class="mini" type="number" name="qty" value="{{ e.qty }}" min="1" step="1" style="max-width: 90px;">
+                        </td>
+                        <td>
+                            <select class="mini" name="store" style="max-width: 320px;">
+                              {% set current = (e.store or '') %}
+                              <option value="Slack" {% if current == 'Slack' %}selected{% endif %}>Slack</option>
+                              {% for s in stores %}
+                                <option value="{{ s }}" {% if current == s %}selected{% endif %}>{{ s }}</option>
+                              {% endfor %}
+                            </select>
+                        </td>
+                        <td>{{ e.created_at }}</td>
+                        <td>
+                            <button class="btnSmall btn-primary" type="submit">Save</button>
+                          </form>
+                          <form method="POST" action="{{ url_for('admin_delete') }}" style="display:inline; margin:0;">
+                            <input type="hidden" name="week" value="{{ selected_week_start }}">
+                            <input type="hidden" name="entry_id" value="{{ e.id }}">
+                            <button class="btnSmall btn-danger" type="submit"
+                                    onclick="return confirm('Delete entry #{{ e.id }}?');">Delete</button>
+                          </form>
+                        </td>
+                      </tr>
+                    {% endfor %}
+                  {% else %}
+                    <tr><td colspan="6" style="color: rgba(15,23,42,.60); font-weight: 900;">No entries yet</td></tr>
+                  {% endif %}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        {% endif %}
+
         <footer>{{ version }}</footer>
       </div>
     </div>
@@ -1109,6 +1339,7 @@ HTML_PAGE = """
   (function(){
     const form = document.getElementById('salesForm');
     const input = document.getElementById('salesInput');
+    if (!form || !input) return;
 
     form.addEventListener('click', (e) => {
       const btn = e.target.closest('button');
@@ -1116,8 +1347,6 @@ HTML_PAGE = """
       input.required = (btn.value === 'add');
       if (btn.value === 'add') input.focus();
     });
-
-    input.required = false;
   })();
   </script>
 </body>
@@ -1179,10 +1408,11 @@ def index():
     admin = is_admin()
 
     if request.method == "POST":
-        action = request.form.get("action", "add")
+        action = request.form.get("action", "")
 
-        if action in ("undo", "reset") and not admin:
-            message = "Permission denied."
+        # Non-admin cannot mutate data from the UI anymore
+        if not admin:
+            message = "Sales are pulled from Slack. Only Tristan can add/remove/edit manually."
             ok = False
             return redirect(url_for("index", week=selected_wk_start.isoformat(), msg=message, ok="0"))
 
@@ -1200,19 +1430,24 @@ def index():
                 message = "Nothing to undo yet."
                 ok = False
 
-        else:  # add
+        elif action == "add":
             raw = (request.form.get("sales") or "").strip()
             store_location = (request.form.get("store_location") or "").strip()
+            rep = (request.form.get("rep") or "").strip() or user_rep
             try:
                 qty = int(raw)
                 if qty <= 0:
                     raise ValueError("qty must be positive")
-                add_entry(selected_wk_start, user_rep, qty, store_location)
-                message = f"Added {qty} sale(s) for {user_rep}."
+                add_entry(selected_wk_start, rep, qty, store_location)
+                message = f"Added {qty} sale(s) for {rep}."
                 ok = True
             except Exception:
                 message = "For Add: enter a valid whole number > 0 and choose a store location."
                 ok = False
+
+        else:
+            message = "Unknown action."
+            ok = False
 
         return redirect(url_for("index", week=selected_wk_start.isoformat(), msg=message, ok=("1" if ok else "0")))
 
@@ -1220,7 +1455,7 @@ def index():
     fill_percentage = clamp((weekly_sales / WEEKLY_GOAL) * 100 if WEEKLY_GOAL else 0, 0, 100)
     remaining = max(0, WEEKLY_GOAL - weekly_sales)
 
-    # Water fill mapping (same)
+    # Water fill mapping
     top_y = 64
     bottom_y = 388
     usable_h = bottom_y - top_y
@@ -1235,18 +1470,16 @@ def index():
     water_h = int(round(max(0, water_h)))
     water_y = int(round(water_y))
 
-    # Leaderboard + daily +amount (Central date)
     rep_rows = rep_totals_with_today(selected_wk_start, today)
-
-    # Store production = weekly totals per store (ALWAYS 4 rows with numbers)
     store_rows = store_totals_for_week(selected_wk_start)
-
     weeks = list_weeks()
+    recent = recent_entries(selected_wk_start, limit=12) if admin else []
 
     return render_template_string(
         HTML_PAGE,
         user_rep=user_rep,
         admin=admin,
+        reps=REPS,
         weekly_sales=weekly_sales,
         goal=WEEKLY_GOAL,
         fill_percentage=fill_percentage,
@@ -1262,9 +1495,61 @@ def index():
         ok=ok,
         rep_rows=rep_rows,
         store_rows=store_rows,
+        recent=recent,
         version=APP_VERSION,
         stores=STORE_LOCATIONS
     )
+
+
+# Admin-only edit/update
+@app.route("/admin/update", methods=["POST"])
+def admin_update():
+    gate = require_login()
+    if gate:
+        return gate
+    if not is_admin():
+        abort(403)
+
+    wk = parse_week_start(request.form.get("week"))
+    week_start = wk or get_week_start(local_today())
+
+    entry_id = request.form.get("entry_id") or ""
+    qty = request.form.get("qty") or ""
+    store = request.form.get("store") or ""
+
+    try:
+        update_entry(int(entry_id), int(qty), store)
+        msg = "Saved changes."
+        ok = "1"
+    except Exception:
+        msg = "Could not save. Qty must be > 0 and Store must be valid."
+        ok = "0"
+
+    return redirect(url_for("index", week=week_start.isoformat(), msg=msg, ok=ok))
+
+
+# Admin-only delete
+@app.route("/admin/delete", methods=["POST"])
+def admin_delete():
+    gate = require_login()
+    if gate:
+        return gate
+    if not is_admin():
+        abort(403)
+
+    wk = parse_week_start(request.form.get("week"))
+    week_start = wk or get_week_start(local_today())
+
+    entry_id = request.form.get("entry_id") or ""
+    try:
+        delete_entry(int(entry_id))
+        msg = f"Deleted entry #{entry_id}."
+        ok = "1"
+    except Exception:
+        msg = "Could not delete that entry."
+        ok = "0"
+
+    return redirect(url_for("index", week=week_start.isoformat(), msg=msg, ok=ok))
 
 
 @app.route("/export.csv")
@@ -1302,7 +1587,68 @@ def export_csv():
     )
 
 
-# Optional: quick sanity check route (admin only) to confirm data persists
+# ---------------- SLACK EVENTS (AUTO +1 WHEN MESSAGE CONTAINS "water") ----------------
+@app.route("/slack/events", methods=["POST"])
+def slack_events():
+    raw = request.get_data(as_text=True) or ""
+    try:
+        payload = json.loads(raw) if raw else {}
+    except Exception:
+        payload = {}
+
+    # 1) Slack URL verification (must respond with JSON {"challenge": "..."} )
+    if payload.get("type") == "url_verification":
+        return jsonify({"challenge": payload.get("challenge", "")})
+
+    # 2) Verify Slack signature
+    if not slack_verify_request(request):
+        return Response("invalid signature", status=403)
+
+    # 3) De-dupe
+    event_id = payload.get("event_id", "")
+    if event_id:
+        global _db_ready
+        if not _db_ready:
+            init_db()
+            _db_ready = True
+        if slack_event_already_processed(event_id):
+            return Response("ok", status=200)
+
+    event = payload.get("event", {}) or {}
+    if event.get("type") != "message":
+        return Response("ok", status=200)
+
+    # Ignore bot/edited/system messages
+    if event.get("subtype"):
+        return Response("ok", status=200)
+
+    # Only count from your specific channel
+    if SLACK_CHANNEL_ID and event.get("channel") != SLACK_CHANNEL_ID:
+        return Response("ok", status=200)
+
+    user = (event.get("user") or "").strip()
+    text = (event.get("text") or "")
+
+    # Only Tristan/Ricky/Sohaib
+    rep = SLACK_USER_TO_REP.get(user)
+    if not rep:
+        return Response("ok", status=200)
+
+    # Must contain "water" (case-insensitive)
+    if "water" not in text.lower():
+        return Response("ok", status=200)
+
+    # Add +1 for current week
+    wk_start = get_week_start(local_today())
+    add_entry_from_slack(wk_start, rep, 1)
+
+    if event_id:
+        mark_slack_event_processed(event_id)
+
+    return Response("ok", status=200)
+
+
+# Optional: quick sanity route (admin only)
 @app.route("/db-status")
 def db_status():
     if not (session.get("logged_in") and session.get("rep") == ADMIN_REP):
@@ -1325,8 +1671,10 @@ def db_status():
 
 
 if __name__ == "__main__":
+    # Do NOT init_db() here (keeps deploy stable + Slack verification reliable)
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
