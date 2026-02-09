@@ -39,7 +39,7 @@ app = Flask(__name__)
 
 # ---------------- CONFIG ----------------
 DEFAULT_WEEKLY_GOAL = 50
-APP_VERSION = "V0.8"  # ✅ bumped
+APP_VERSION = "V0.8.1"  # ✅ bumped
 
 REPS = ["Tristan", "Ricky", "Sohaib"]
 ADMIN_REP = "Tristan"
@@ -66,19 +66,6 @@ SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "").strip()
 
 # For posting sales to Slack (fool-proof)
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
-
-# Keep these only if you still want to map Slack users later (not used to create sales)
-SLACK_TRISTAN_ID = os.environ.get("SLACK_TRISTAN_ID", "").strip()
-SLACK_RICKY_ID = os.environ.get("SLACK_RICKY_ID", "").strip()
-SLACK_SOHAIB_ID = os.environ.get("SLACK_SOHAIB_ID", "").strip()
-
-SLACK_USER_TO_REP = {
-    SLACK_TRISTAN_ID: "Tristan",
-    SLACK_RICKY_ID: "Ricky",
-    SLACK_SOHAIB_ID: "Sohaib",
-}
-SLACK_USER_TO_REP = {k: v for k, v in SLACK_USER_TO_REP.items() if k}
-# ---------------------------------------------
 
 
 # -------- Timezone (Central, safe fallback) --------
@@ -178,7 +165,7 @@ def init_db():
                 );
             """)
 
-            # 3) Indexes
+            # 3) Indexes (safe now that columns exist)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week ON sales_entries(week_start);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week_rep ON sales_entries(week_start, rep);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week_created ON sales_entries(week_start, created_at);")
@@ -192,15 +179,16 @@ def init_db():
             """)
 
             # 4) Seed your Costco stores (upsert)
+            # NOTE: coordinates are best-effort; tweak radius_m if needed (e.g., 250-350).
             seed_stores = [
-                ("Costco - University City", "8685 Olive Blvd, Saint Louis, MO 63132",
-                 38.6762657, -90.3590698, 180),
+                ("Costco - University City", "8695 Olive Blvd, University City, MO 63132",
+                 38.6762657, -90.3590698, 220),
                 ("Costco - St. Peters", "200 Costco Way, Saint Peters, MO 63376-4385",
-                 38.7963905, -90.6071090, 180),
+                 38.7963905, -90.6071090, 220),
                 ("Costco - St Louis", "4200 Rusty Rd, Saint Louis, MO 63128-1973",
-                 38.5085416, -90.3388793, 180),
+                 38.5085416, -90.3388793, 220),
                 ("Costco - Manchester", "301 Highlands Blvd Drive, Manchester, MO 63011",
-                 38.5977985, -90.5071777, 180),
+                 38.5977985, -90.5071777, 220),
             ]
             for name, address, lat, lon, radius in seed_stores:
                 cur.execute("""
@@ -585,14 +573,23 @@ def add_entry_gps(week_start: date, rep: str, qty: int):
     if rep not in REPS:
         raise ValueError("invalid rep")
 
-    if not gps_is_fresh_and_locked():
+    if not is_admin() and not gps_is_fresh_and_locked():
         raise ValueError("GPS not locked")
 
-    store_id = int(session.get("store_id"))
+    # Admin can add without GPS (defaults to no store)
+    store_id = session.get("store_id")
     store_name = session.get("store_name") or ""
     lat = session.get("gps_lat")
     lon = session.get("gps_lon")
     acc = session.get("gps_accuracy_m")
+
+    if is_admin() and not gps_is_fresh_and_locked():
+        store_id = None
+        store_name = "Admin"
+        lat = None
+        lon = None
+        acc = None
+
     created_date = local_today()
 
     with db_conn() as conn:
@@ -654,7 +651,7 @@ def reset_week(week_start: date):
         conn.commit()
 
 
-# ---------------- UI (your existing pages, with GPS + admin goal added) ----------------
+# ---------------- UI ----------------
 LOGIN_PAGE = """<!DOCTYPE html>
 <html>
 <head>
@@ -831,25 +828,20 @@ LOGIN_PAGE = """<!DOCTYPE html>
 </html>
 """
 
-# ✅ Realistic Slack logo SVG (inline)
 SLACK_SVG = """
 <svg viewBox="0 0 24 24" aria-hidden="true">
   <path fill="#E01E5A" d="M6.1 13.6a1.9 1.9 0 1 1-1.9-1.9h1.9v1.9Z"/>
   <path fill="#E01E5A" d="M7.1 13.6a1.9 1.9 0 1 1 1.9-1.9v1.9H7.1Z"/>
-
   <path fill="#36C5F0" d="M10.4 6.1a1.9 1.9 0 1 1 1.9-1.9v1.9h-1.9Z"/>
   <path fill="#36C5F0" d="M10.4 7.1a1.9 1.9 0 1 1-1.9 1.9V7.1h1.9Z"/>
-
   <path fill="#2EB67D" d="M17.9 10.4a1.9 1.9 0 1 1 1.9 1.9h-1.9v-1.9Z"/>
   <path fill="#2EB67D" d="M16.9 10.4a1.9 1.9 0 1 1-1.9-1.9h1.9v1.9Z"/>
-
   <path fill="#ECB22E" d="M13.6 17.9a1.9 1.9 0 1 1-1.9 1.9v-1.9h1.9Z"/>
   <path fill="#ECB22E" d="M13.6 16.9a1.9 1.9 0 1 1 1.9-1.9v1.9h-1.9Z"/>
 </svg>
 """
 
-# --- Main page HTML (your existing UI, with GPS pill + admin goal) ---
-HTML_PAGE = f"""
+HTML_PAGE = """
 <!DOCTYPE html>
 <html>
 <head>
@@ -857,7 +849,7 @@ HTML_PAGE = f"""
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Primo Sales Tracker</title>
   <style>
-    :root{{
+    :root{
       --bgA:#ecfbff; --bgB:#cfefff;
       --text:#0f172a; --muted:#475569;
       --card:rgba(255,255,255,.92);
@@ -865,118 +857,140 @@ HTML_PAGE = f"""
       --shadow:0 14px 34px rgba(0,0,0,.12);
       --primary:#2563eb; --danger:#ef4444;
       --focus: rgba(37,99,235,.20);
-    }}
-    *{{ box-sizing:border-box; }}
-    body{{
+    }
+    *{ box-sizing:border-box; }
+    body{
       margin:0; padding: 12px;
       font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
       color:var(--text);
       background: radial-gradient(circle at 18% 12%, #ffffff 0%, var(--bgA) 40%, var(--bgB) 100%);
-    }}
-    .wrap{{ max-width: 1100px; margin: 0 auto; }}
-    .topbar{{
+    }
+    .wrap{ max-width: 1100px; margin: 0 auto; }
+    .topbar{
       display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px;
       padding:10px 12px; border-radius:16px; background: rgba(255,255,255,.92);
       border: 1px solid var(--border); box-shadow: var(--shadow); backdrop-filter: blur(10px);
-    }}
-    .brand{{ display:flex; align-items:center; gap:10px; min-width: 220px; }}
-    .logo{{
+    }
+    .brand{ display:flex; align-items:center; gap:10px; min-width: 220px; }
+    .logo{
       width:32px; height:32px; border-radius:12px;
       background: linear-gradient(135deg, var(--primary), #06b6d4);
       box-shadow: 0 10px 16px rgba(37,99,235,.16);
       flex: 0 0 auto;
-    }}
-    .brand h1{{ font-size:14px; margin:0; font-weight:950; line-height:1.1; }}
-    .brand .sub{{ margin:2px 0 0; font-size:11px; color: var(--muted); font-weight:850; }}
-    .topActions{{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }}
-    .pill{{
+    }
+    .brand h1{ font-size:14px; margin:0; font-weight:950; line-height:1.1; }
+    .brand .sub{ margin:2px 0 0; font-size:11px; color: var(--muted); font-weight:850; }
+    .topActions{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }
+    .pill{
       display:inline-flex; align-items:center; gap:8px;
       padding:6px 10px; border-radius:999px; background: rgba(15,23,42,.06);
       border: 1px solid rgba(15,23,42,.08); color: rgba(15,23,42,.82);
       font-size: 11px; white-space: nowrap; font-weight: 900;
-    }}
-    .pill.ok{{ background: rgba(34,197,94,.12); border-color: rgba(34,197,94,.22); }}
-    .pill.warn{{ background: rgba(245,158,11,.14); border-color: rgba(245,158,11,.25); }}
-    .logout{{
+    }
+    .pill.ok{ background: rgba(34,197,94,.12); border-color: rgba(34,197,94,.22); }
+    .pill.warn{ background: rgba(245,158,11,.14); border-color: rgba(245,158,11,.25); }
+    .logout{
       text-decoration:none; font-weight: 950; font-size: 12px; color: rgba(15,23,42,.72);
       padding: 6px 10px; border-radius: 999px; border: 1px solid rgba(15,23,42,.10);
       background: rgba(255,255,255,.90);
-    }}
-    .grid{{ display:grid; grid-template-columns: 1fr; gap: 12px; margin-top: 12px; align-items:start; }}
-    @media (min-width: 980px){{ .grid{{ grid-template-columns: 420px 1fr; }} }}
-    .card{{
+    }
+    .grid{ display:grid; grid-template-columns: 1fr; gap: 12px; margin-top: 12px; align-items:start; }
+    @media (min-width: 980px){ .grid{ grid-template-columns: 420px 1fr; } }
+    .card{
       background: var(--card); border: 1px solid var(--border); border-radius: 18px;
       box-shadow: var(--shadow); backdrop-filter: blur(10px); padding: 12px;
-    }}
-    .jugPanel{{ border-radius: 16px; background: rgba(255,255,255,.88); border: 1px solid rgba(15,23,42,.08); padding: 10px; }}
-    .jugWrap{{ display:flex; flex-direction:column; align-items:center; gap:10px; }}
-    .jugSvg{{ width: min(320px, 100%); height:auto; user-select:none; filter: drop-shadow(0 14px 18px rgba(0,0,0,.16)); }}
-    .kpis{{ display:grid; grid-template-columns: 1fr 1fr 1fr; gap:8px; width: 100%; }}
-    .kpi{{ padding: 10px; border-radius: 14px; background: rgba(255,255,255,.92); border: 1px solid rgba(15,23,42,.08); box-shadow: 0 10px 16px rgba(0,0,0,.06); }}
-    .kpi .label{{ font-size:10px; color: var(--muted); margin-bottom:4px; font-weight:950; text-transform: uppercase; letter-spacing: .06em; }}
-    .kpi .value{{ font-size:18px; font-weight:950; margin:0; }}
-    .flash{{ width:100%; padding: 10px 12px; border-radius: 14px; border: 1px solid rgba(15,23,42,.12); background: rgba(255,255,255,.92); font-weight: 850; font-size: 13px; }}
-    .flash.ok{{ border-color: rgba(34,197,94,.25); background: rgba(34,197,94,.10); }}
-    .flash.bad{{ border-color: rgba(239,68,68,.28); background: rgba(239,68,68,.10); }}
-    .sectionHead{{ display:flex; align-items:center; justify-content:space-between; gap:10px; padding: 10px 10px; border-radius: 14px;
+    }
+    .jugPanel{ border-radius: 16px; background: rgba(255,255,255,.88); border: 1px solid rgba(15,23,42,.08); padding: 10px; }
+    .jugWrap{ display:flex; flex-direction:column; align-items:center; gap:10px; }
+    .jugSvg{ width: min(320px, 100%); height:auto; user-select:none; filter: drop-shadow(0 14px 18px rgba(0,0,0,.16)); }
+    .kpis{ display:grid; grid-template-columns: 1fr 1fr 1fr; gap:8px; width: 100%; }
+    .kpi{ padding: 10px; border-radius: 14px; background: rgba(255,255,255,.92); border: 1px solid rgba(15,23,42,.08); box-shadow: 0 10px 16px rgba(0,0,0,.06); }
+    .kpi .label{ font-size:10px; color: var(--muted); margin-bottom:4px; font-weight:950; text-transform: uppercase; letter-spacing: .06em; }
+    .kpi .value{ font-size:18px; font-weight:950; margin:0; }
+    .flash{ width:100%; padding: 10px 12px; border-radius: 14px; border: 1px solid rgba(15,23,42,.12); background: rgba(255,255,255,.92); font-weight: 850; font-size: 13px; }
+    .flash.ok{ border-color: rgba(34,197,94,.25); background: rgba(34,197,94,.10); }
+    .flash.bad{ border-color: rgba(239,68,68,.28); background: rgba(239,68,68,.10); }
+    .sectionHead{
+      display:flex; align-items:center; justify-content:space-between; gap:10px; padding: 10px 10px; border-radius: 14px;
       background: rgba(15,23,42,.05); border: 1px solid rgba(15,23,42,.08);
       font-weight: 950; font-size: 12px; color: rgba(15,23,42,.78);
-      text-transform: uppercase; letter-spacing: .04em; margin-bottom: 10px; }}
-    .weekRow{{ display:flex; gap:10px; flex-wrap:wrap; margin-bottom: 12px; align-items:center; }}
-    .weekRow > select{{ flex: 1 1 280px; }}
-    form.controls{{ display:grid; grid-template-columns: 1fr; gap:10px; padding: 10px; border-radius: 16px;
+      text-transform: uppercase; letter-spacing: .04em; margin-bottom: 10px;
+    }
+    .weekRow{ display:flex; gap:10px; flex-wrap:wrap; margin-bottom: 12px; align-items:center; }
+    .weekRow > select{ flex: 1 1 280px; }
+    form.controls{
+      display:grid; grid-template-columns: 1fr; gap:10px; padding: 10px; border-radius: 16px;
       background: rgba(255,255,255,.88); border: 1px solid rgba(15,23,42,.08);
-      box-shadow: 0 10px 16px rgba(0,0,0,.06); margin-bottom: 12px; }}
-    .formGrid{{ display:grid; grid-template-columns: 1fr; gap:10px; }}
-    @media (min-width: 760px){{ .formGrid{{ grid-template-columns: 1fr 1fr; }} .formGrid .span2{{ grid-column: span 2; }} }}
-    .btnRow{{ display:grid; grid-template-columns: 1fr 1fr; gap:10px; }}
-    .btnRow .span2{{ grid-column: span 2; }}
-    @media (max-width: 420px){{ .btnRow{{ grid-template-columns: 1fr; }} .btnRow .span2{{ grid-column: auto; }} }}
-    input, select{{ height: 44px; padding: 0 12px; border-radius: 12px; border: 1px solid rgba(15,23,42,.18); outline: none;
-      font-size: 14px; background: rgba(255,255,255,.98); font-weight: 850; width: 100%; min-width: 0; }}
-    input:focus, select:focus{{ box-shadow: 0 0 0 4px var(--focus); border-color: rgba(37,99,235,.55); }}
-    button, a.btn{{ height: 44px; padding: 0 12px; border-radius: 12px; border: 1px solid rgba(15,23,42,.14); background: rgba(255,255,255,.96);
+      box-shadow: 0 10px 16px rgba(0,0,0,.06); margin-bottom: 12px;
+    }
+    .formGrid{ display:grid; grid-template-columns: 1fr; gap:10px; }
+    @media (min-width: 760px){ .formGrid{ grid-template-columns: 1fr 1fr; } .formGrid .span2{ grid-column: span 2; } }
+    .btnRow{ display:grid; grid-template-columns: 1fr 1fr; gap:10px; }
+    .btnRow .span2{ grid-column: span 2; }
+    @media (max-width: 420px){ .btnRow{ grid-template-columns: 1fr; } .btnRow .span2{ grid-column: auto; } }
+    input, select{
+      height: 44px; padding: 0 12px; border-radius: 12px; border: 1px solid rgba(15,23,42,.18); outline: none;
+      font-size: 14px; background: rgba(255,255,255,.98); font-weight: 850; width: 100%; min-width: 0;
+    }
+    input:focus, select:focus{ box-shadow: 0 0 0 4px var(--focus); border-color: rgba(37,99,235,.55); }
+    button, a.btn{
+      height: 44px; padding: 0 12px; border-radius: 12px; border: 1px solid rgba(15,23,42,.14); background: rgba(255,255,255,.96);
       cursor:pointer; font-weight: 950; font-size: 14px; transition: transform .08s ease; text-decoration:none; color: inherit;
-      display:flex; align-items:center; justify-content:center; gap:8px; white-space: nowrap; width: 100%; }}
-    button:hover, a.btn:hover{{ transform: translateY(-1px); }}
-    button:disabled{{ opacity:.55; cursor:not-allowed; transform:none; }}
-    .btn-primary{{ background: linear-gradient(180deg, rgba(37,99,235,.95), rgba(29,78,216,.95)); color: white;
-      border-color: rgba(29,78,216,.25); box-shadow: 0 10px 16px rgba(37,99,235,.14); }}
-    .btn-danger{{ background: rgba(239,68,68,.12); border-color: rgba(239,68,68,.25); color: rgba(127,29,29,.95); }}
-    .btn-ghost{{ background: rgba(15,23,42,.06); border-color: rgba(15,23,42,.10); color: rgba(15,23,42,.85); width:auto; padding: 0 14px; }}
-    .tables{{ display:grid; grid-template-columns: 1fr; gap: 12px; }}
-    @media (min-width: 980px){{ .tables{{ grid-template-columns: 1fr 1fr; }} }}
-    .tableCard{{ border-radius: 16px; background: rgba(255,255,255,.88); border: 1px solid rgba(15,23,42,.08); overflow:hidden; }}
-    .tableTitle{{ padding: 10px 12px; font-weight: 950; font-size: 12px; color: rgba(15,23,42,.78);
+      display:flex; align-items:center; justify-content:center; gap:8px; white-space: nowrap; width: 100%;
+    }
+    button:hover, a.btn:hover{ transform: translateY(-1px); }
+    button:disabled{ opacity:.55; cursor:not-allowed; transform:none; }
+    .btn-primary{
+      background: linear-gradient(180deg, rgba(37,99,235,.95), rgba(29,78,216,.95)); color: white;
+      border-color: rgba(29,78,216,.25); box-shadow: 0 10px 16px rgba(37,99,235,.14);
+    }
+    .btn-danger{ background: rgba(239,68,68,.12); border-color: rgba(239,68,68,.25); color: rgba(127,29,29,.95); }
+    .btn-ghost{ background: rgba(15,23,42,.06); border-color: rgba(15,23,42,.10); color: rgba(15,23,42,.85); width:auto; padding: 0 14px; }
+    .tables{ display:grid; grid-template-columns: 1fr; gap: 12px; }
+    @media (min-width: 980px){ .tables{ grid-template-columns: 1fr 1fr; } }
+    .tableCard{ border-radius: 16px; background: rgba(255,255,255,.88); border: 1px solid rgba(15,23,42,.08); overflow:hidden; }
+    .tableTitle{
+      padding: 10px 12px; font-weight: 950; font-size: 12px; color: rgba(15,23,42,.78);
       background: rgba(15,23,42,.05); border-bottom: 1px solid rgba(15,23,42,.08);
       text-transform: uppercase; letter-spacing: .04em;
-      display:flex; align-items:center; justify-content:space-between; gap:10px; }}
-    .slackIcon{{ display:inline-flex; align-items:center; justify-content:center; width: 24px; height: 24px; border-radius: 8px;
-      background: rgba(255,255,255,.96); border: 1px solid rgba(15,23,42,.10); box-shadow: 0 8px 12px rgba(0,0,0,.06); }}
-    .slackIcon svg{{ width: 16px; height: 16px; display:block; }}
-    .tableWrap{{ max-height: 220px; overflow:auto; }}
-    @media (min-width: 980px){{ .tableWrap{{ max-height: none; overflow: visible; }} }}
-    table{{ width:100%; border-collapse: collapse; min-width: 420px; }}
-    th, td{{ padding: 10px 10px; font-size: 13px; text-align:left; border-bottom: 1px solid rgba(15,23,42,.08);
-      white-space: nowrap; vertical-align: top; background: rgba(255,255,255,.94); }}
-    th{{ position: sticky; top: 0; z-index: 1; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: rgba(15,23,42,.65);
-      background: rgba(255,255,255,.98); }}
-    table.storeTable{{ min-width: 0 !important; width: 100% !important; table-layout: fixed; }}
-    table.storeTable th, table.storeTable td{{ white-space: normal !important; }}
-    table.storeTable th:last-child, table.storeTable td:last-child{{ text-align: right; width: 90px; }}
-    details.manageDetails{{ margin-top: 12px; border-radius: 16px; background: rgba(255,255,255,.88); border: 1px solid rgba(15,23,42,.08); overflow:hidden; }}
-    details.manageDetails > summary{{ list-style: none; cursor: pointer; padding: 10px 12px; font-weight: 950; font-size: 12px;
+      display:flex; align-items:center; justify-content:space-between; gap:10px;
+    }
+    .slackIcon{
+      display:inline-flex; align-items:center; justify-content:center; width: 24px; height: 24px; border-radius: 8px;
+      background: rgba(255,255,255,.96); border: 1px solid rgba(15,23,42,.10); box-shadow: 0 8px 12px rgba(0,0,0,.06);
+    }
+    .slackIcon svg{ width: 16px; height: 16px; display:block; }
+    .tableWrap{ max-height: 220px; overflow:auto; }
+    @media (min-width: 980px){ .tableWrap{ max-height: none; overflow: visible; } }
+    table{ width:100%; border-collapse: collapse; min-width: 420px; }
+    th, td{
+      padding: 10px 10px; font-size: 13px; text-align:left; border-bottom: 1px solid rgba(15,23,42,.08);
+      white-space: nowrap; vertical-align: top; background: rgba(255,255,255,.94);
+    }
+    th{
+      position: sticky; top: 0; z-index: 1; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: rgba(15,23,42,.65);
+      background: rgba(255,255,255,.98);
+    }
+    table.storeTable{ min-width: 0 !important; width: 100% !important; table-layout: fixed; }
+    table.storeTable th, table.storeTable td{ white-space: normal !important; }
+    table.storeTable th:last-child, table.storeTable td:last-child{ text-align: right; width: 90px; }
+    details.manageDetails{
+      margin-top: 12px; border-radius: 16px; background: rgba(255,255,255,.88); border: 1px solid rgba(15,23,42,.08); overflow:hidden;
+    }
+    details.manageDetails > summary{
+      list-style: none; cursor: pointer; padding: 10px 12px; font-weight: 950; font-size: 12px;
       color: rgba(15,23,42,.78); background: rgba(15,23,42,.05); border-bottom: 1px solid rgba(15,23,42,.08);
-      text-transform: uppercase; letter-spacing: .04em; user-select:none; display:flex; align-items:center; justify-content:space-between; gap:10px; }}
-    details.manageDetails > summary::-webkit-details-marker{{ display:none; }}
-    .chev{{ font-size: 12px; color: rgba(15,23,42,.55); font-weight: 950; }}
-    .manageWrap{{ max-height: 260px; overflow: auto; }}
-    @media (max-width: 520px){{ .manageWrap{{ max-height: 320px; }} }}
-    table.manageTable{{ min-width: 0 !important; width: 100% !important; table-layout: fixed; }}
-    table.manageTable td, table.manageTable th{{ white-space: normal !important; }}
-    .mini{{ height: 38px !important; font-size: 12px !important; font-weight: 850 !important; }}
-    .btnSmall{{ height: 38px !important; font-size: 12px !important; font-weight: 950 !important; padding: 0 10px !important; }}
-    footer{{ margin-top: 10px; text-align:center; color: rgba(15,23,42,.55); font-weight: 900; font-size: 12px; padding: 6px 0 2px; }}
+      text-transform: uppercase; letter-spacing: .04em; user-select:none; display:flex; align-items:center; justify-content:space-between; gap:10px;
+    }
+    details.manageDetails > summary::-webkit-details-marker{ display:none; }
+    .chev{ font-size: 12px; color: rgba(15,23,42,.55); font-weight: 950; }
+    .manageWrap{ max-height: 260px; overflow: auto; }
+    @media (max-width: 520px){ .manageWrap{ max-height: 320px; } }
+    table.manageTable{ min-width: 0 !important; width: 100% !important; table-layout: fixed; }
+    table.manageTable td, table.manageTable th{ white-space: normal !important; }
+    .mini{ height: 38px !important; font-size: 12px !important; font-weight: 850 !important; }
+    .btnSmall{ height: 38px !important; font-size: 12px !important; font-weight: 950 !important; padding: 0 10px !important; }
+    footer{ margin-top: 10px; text-align:center; color: rgba(15,23,42,.55); font-weight: 900; font-size: 12px; padding: 6px 0 2px; }
   </style>
 </head>
 <body>
@@ -1029,32 +1043,38 @@ HTML_PAGE = f"""
                     Z
                   " />
                 </clipPath>
+
                 <linearGradient id="plastic" x1="0" x2="1">
                   <stop offset="0" stop-color="rgba(255,255,255,0.22)" />
                   <stop offset="0.28" stop-color="rgba(255,255,255,0.12)" />
                   <stop offset="0.55" stop-color="rgba(0,0,0,0.08)" />
                   <stop offset="1" stop-color="rgba(255,255,255,0.22)" />
                 </linearGradient>
+
                 <linearGradient id="waterGrad" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="0" stop-color="rgba(190,237,255,0.96)"/>
                   <stop offset="0.62" stop-color="rgba(100,207,250,0.95)"/>
                   <stop offset="1" stop-color="rgba(2,132,199,0.96)"/>
                 </linearGradient>
+
                 <linearGradient id="waterEdge" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="0" stop-color="rgba(255,255,255,0.20)"/>
                   <stop offset="1" stop-color="rgba(255,255,255,0.00)"/>
                 </linearGradient>
+
                 <linearGradient id="capBlue" x1="0" x2="0" y1="0" y2="1">
                   <stop offset="0" stop-color="rgba(59,130,246,0.98)"/>
                   <stop offset="0.6" stop-color="rgba(37,99,235,0.98)"/>
                   <stop offset="1" stop-color="rgba(30,64,175,0.98)"/>
                 </linearGradient>
+
                 <linearGradient id="sheen" x1="0" x2="1">
                   <stop offset="0" stop-color="rgba(255,255,255,0.12)"/>
                   <stop offset="0.35" stop-color="rgba(255,255,255,0.04)" />
                   <stop offset="0.60" stop-color="rgba(0,0,0,0.04)" />
                   <stop offset="1" stop-color="rgba(255,255,255,0.10)" />
                 </linearGradient>
+
                 <path id="primoArc" d="M86 198 C122 190 158 190 194 198" />
                 <path id="waterArc" d="M98 220 C128 216 152 216 182 220" />
               </defs>
@@ -1156,7 +1176,6 @@ HTML_PAGE = f"""
 
         <form method="POST" id="salesForm" class="controls" autocomplete="off">
           <input type="hidden" name="week" value="{{ selected_week_start }}">
-
           <div class="formGrid">
             {% if admin %}
               <div>
@@ -1166,8 +1185,14 @@ HTML_PAGE = f"""
                   {% endfor %}
                 </select>
               </div>
+              <div>
+                <input type="number" id="salesInput" name="sales" placeholder="Quantity" min="1" step="1" required>
+              </div>
             {% else %}
               <input type="hidden" name="rep" value="{{ user_rep }}">
+              <div class="span2">
+                <input type="number" id="salesInput" name="sales" placeholder="Quantity" min="1" step="1" required>
+              </div>
               <div class="span2">
                 <div class="pill warn" style="width:100%; justify-content:space-between;">
                   <span>GPS required:</span>
@@ -1175,20 +1200,14 @@ HTML_PAGE = f"""
                 </div>
               </div>
             {% endif %}
-
-            <div class="span2">
-              <input type="number" id="salesInput" name="sales" placeholder="Quantity" min="1" step="1" required>
-            </div>
           </div>
 
           <div class="btnRow">
             <button id="addBtn" type="submit" name="action" value="add" class="btn-primary span2">Add Sale</button>
-
             {% if admin %}
               <button type="submit" name="action" value="reset" class="btn-danger"
                       onclick="return confirm('Reset this week\\'s total to 0?');">Reset</button>
             {% endif %}
-
             <a class="btn span2" href="{{ url_for('export_csv', week=selected_week_start) }}">Export CSV</a>
           </div>
         </form>
@@ -1212,7 +1231,7 @@ HTML_PAGE = f"""
           <div class="tableCard">
             <div class="tableTitle">
               <div>Leaderboard</div>
-              <div class="slackIcon" title="Slack posts are generated by the app" aria-label="Slack">{SLACK_SVG}</div>
+              <div class="slackIcon" aria-label="Slack">__SLACK_SVG__</div>
             </div>
             <div class="tableWrap">
               <table>
@@ -1236,7 +1255,7 @@ HTML_PAGE = f"""
           <div class="tableCard">
             <div class="tableTitle">
               <div>Store production</div>
-              <div class="slackIcon" title="Store determined by GPS geofence" aria-label="Slack">{SLACK_SVG}</div>
+              <div class="slackIcon" aria-label="Slack">__SLACK_SVG__</div>
             </div>
             <div class="tableWrap">
               <table class="storeTable">
@@ -1323,6 +1342,7 @@ HTML_PAGE = f"""
     const storeText = document.getElementById('storeText');
     const gpsStatusText = document.getElementById('gpsStatusText');
     const addBtn = document.getElementById('addBtn');
+    const isAdmin = {{ 'true' if admin else 'false' }};
 
     function setPill(mode, text){
       if (!storePill || !storeText) return;
@@ -1337,6 +1357,11 @@ HTML_PAGE = f"""
     }
 
     async function pingLocation(){
+      if (isAdmin){
+        setPill('ok','Admin');
+        if (addBtn) addBtn.disabled = false;
+        return;
+      }
       if (!navigator.geolocation){
         setPill('warn','No GPS');
         setGpsStatus('GPS not supported', false);
@@ -1362,7 +1387,7 @@ HTML_PAGE = f"""
           setPill('warn','Ping failed');
           setGpsStatus('Network error', false);
         }
-      }, (err) => {
+      }, () => {
         setPill('warn','Location blocked');
         setGpsStatus('Enable location permission', false);
       }, {enableHighAccuracy:true, timeout:8000, maximumAge:0});
@@ -1370,14 +1395,14 @@ HTML_PAGE = f"""
 
     pingLocation();
     setInterval(pingLocation, 120000);
-
-    const isAdmin = {{ 'true' if admin else 'false' }};
-    if (isAdmin === 'true' && addBtn) addBtn.disabled = false;
   })();
   </script>
 </body>
 </html>
 """
+
+HTML_PAGE = HTML_PAGE.replace("__SLACK_SVG__", SLACK_SVG)
+
 
 # ---------------- Routes ----------------
 @app.route("/login", methods=["GET", "POST"])
@@ -1424,7 +1449,6 @@ def api_location_ping():
     except Exception:
         return jsonify({"ok": False, "locked": False, "reason": "Bad location payload"}), 400
 
-    # store raw
     session["gps_lat"] = lat
     session["gps_lon"] = lon
     session["gps_accuracy_m"] = accuracy_m
@@ -1499,7 +1523,7 @@ def index():
                 entry_id, slack_ok, store_name = add_entry_gps(selected_wk_start, rep, qty)
                 msg = f"Added {qty} sale(s) for {rep} at {store_name}."
                 if not slack_ok:
-                    msg += " (Slack post not sent — set SLACK_BOT_TOKEN + SLACK_CHANNEL_ID.)"
+                    msg += " (Slack post not sent — add requests + set SLACK_BOT_TOKEN + SLACK_CHANNEL_ID.)"
                 return redirect(url_for("index", week=selected_wk_start.isoformat(), msg=msg, ok="1"))
             except Exception:
                 return redirect(url_for("index", week=selected_wk_start.isoformat(),
@@ -1679,7 +1703,6 @@ def export_csv():
 def slack_events():
     payload = request.get_json(silent=True) or {}
 
-    # Slack URL verification
     if payload.get("type") == "url_verification":
         return jsonify({"challenge": payload.get("challenge", "")})
 
@@ -1704,12 +1727,10 @@ def slack_events():
 
     subtype = event.get("subtype")
 
-    # Ignore edits
     if subtype == "message_changed":
         mark_slack_event_processed(event_id)
         return Response("ok", status=200)
 
-    # If message deleted, remove matching sale if it was posted by the app
     if subtype == "message_deleted":
         deleted_ts = (event.get("deleted_ts") or "").strip()
         if not deleted_ts:
@@ -1752,7 +1773,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     init_db()
     app.run(host="0.0.0.0", port=port)
-
 
 
 
