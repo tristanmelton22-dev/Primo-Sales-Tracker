@@ -10,6 +10,7 @@ import json
 import time
 import hmac
 import hashlib
+import math
 
 # Python 3.9+ zoneinfo, but some Windows installs can be missing tzdata.
 try:
@@ -21,28 +22,27 @@ except Exception:
 # requirements.txt MUST include: psycopg[binary]
 try:
     import psycopg
+    from psycopg.rows import dict_row
 except Exception as e:
     raise RuntimeError(
         "Missing dependency psycopg. Add 'psycopg[binary]' to requirements.txt"
     ) from e
 
+# Optional: requests for Slack posting
+try:
+    import requests
+except Exception:
+    requests = None
 
 app = Flask(__name__)
 
 # ---------------- CONFIG ----------------
-WEEKLY_GOAL = 50
-APP_VERSION = "V0.7"  # ✅ bumped
+DEFAULT_WEEKLY_GOAL = 50
+APP_VERSION = "V0.8"  # ✅ bumped
 
 REPS = ["Tristan", "Ricky", "Sohaib"]
 ADMIN_REP = "Tristan"
 DEFAULT_REP = REPS[0] if REPS else "Rep"
-
-STORE_LOCATIONS = [
-    "Costco - University City",
-    "Costco - Manchester",
-    "Costco - St Louis",
-    "Costco - St. Peters",
-]
 
 USER_PASSWORDS = {
     "Tristan": "Primo1234!",
@@ -59,9 +59,14 @@ if not DATABASE_URL:
     )
 
 # ---------------- SLACK CONFIG ----------------
+# Incoming events verification (optional but recommended)
 SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET", "").strip()
 SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "").strip()
 
+# Bot posting (for fool-proof method)
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+
+# Keep these for mapping Slack user -> rep only if you still want to accept some Slack-based behavior.
 SLACK_TRISTAN_ID = os.environ.get("SLACK_TRISTAN_ID", "").strip()
 SLACK_RICKY_ID = os.environ.get("SLACK_RICKY_ID", "").strip()
 SLACK_SOHAIB_ID = os.environ.get("SLACK_SOHAIB_ID", "").strip()
@@ -92,14 +97,50 @@ def local_today() -> date:
     return datetime.now(TZ).date()
 
 
+def now_ts() -> float:
+    return time.time()
+
+
 # ---------------- Postgres helpers ----------------
 def db_conn():
-    return psycopg.connect(DATABASE_URL)
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
 def init_db():
+    """
+    Creates/updates DB schema safely.
+    Includes:
+      - stores table with Costco geofences
+      - weekly goals table (per week_start)
+      - sales_entries store-aware columns
+      - slack mapping for delete/undo if slack message removed
+      - event dedupe table (optional)
+    """
     with db_conn() as conn:
         with conn.cursor() as cur:
+            # Stores (geofences)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS stores (
+                    id BIGSERIAL PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    address TEXT NOT NULL,
+                    lat DOUBLE PRECISION NOT NULL,
+                    lon DOUBLE PRECISION NOT NULL,
+                    radius_m INTEGER NOT NULL DEFAULT 150,
+                    active BOOLEAN NOT NULL DEFAULT TRUE
+                );
+            """)
+
+            # Weekly goal per week_start (Monday)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS weekly_goals (
+                    week_start DATE PRIMARY KEY,
+                    goal_qty INTEGER NOT NULL DEFAULT 50,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+
+            # Sales entries (store-aware)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS sales_entries (
                     id BIGSERIAL PRIMARY KEY,
@@ -107,17 +148,25 @@ def init_db():
                     rep TEXT NOT NULL,
                     qty INTEGER NOT NULL CHECK (qty > 0),
                     created_at DATE NOT NULL,
-                    note TEXT NOT NULL DEFAULT ''
+                    note TEXT NOT NULL DEFAULT '',
+                    store_id BIGINT NULL REFERENCES stores(id),
+                    lat DOUBLE PRECISION NULL,
+                    lon DOUBLE PRECISION NULL,
+                    accuracy_m DOUBLE PRECISION NULL,
+                    slack_channel TEXT NULL,
+                    slack_ts TEXT NULL
                 );
             """)
-            # ✅ track which Slack messages were processed (dedupe by event_id)
+
+            # ✅ track which Slack events were processed (dedupe by event_id)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS slack_processed_events (
                     event_id TEXT PRIMARY KEY,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
             """)
-            # ✅ NEW: map Slack message -> sales entry so deletes can remove the right sale
+
+            # ✅ map Slack message -> sales entry so deletes can remove the right sale
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS slack_message_sales (
                     channel_id TEXT NOT NULL,
@@ -130,9 +179,52 @@ def init_db():
                 );
             """)
 
+            # Indices
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week ON sales_entries(week_start);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week_rep ON sales_entries(week_start, rep);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_week_created ON sales_entries(week_start, created_at);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_sales_entries_store_week ON sales_entries(store_id, week_start);")
+
+            # Optional unique index for slack mapping columns (safe; IF NOT EXISTS)
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_sales_slack_msg
+                ON sales_entries (slack_channel, slack_ts)
+                WHERE slack_channel IS NOT NULL AND slack_channel <> '' AND slack_ts IS NOT NULL AND slack_ts <> '';
+            """)
+
+            # Seed Costco stores (lat/lon hardcoded; admin can tweak radius)
+            # These coordinates are used purely for geofencing; you can adjust if needed.
+            seed_stores = [
+                ("Costco - University City", "8685 Olive Blvd, Saint Louis, MO 63132",
+                 38.6762657, -90.3590698, 180),
+                ("Costco - St. Peters", "200 Costco Way, Saint Peters, MO 63376",
+                 38.7963905, -90.6071090, 180),
+                ("Costco - St Louis", "4200 Rusty Rd, Saint Louis, MO 63128",
+                 38.5085416, -90.3388793, 180),
+                ("Costco - Manchester", "301 Highlands Blvd Drive, Manchester, MO 63011",
+                 38.5977985, -90.5071777, 180),
+            ]
+            for name, address, lat, lon, radius in seed_stores:
+                cur.execute("""
+                    INSERT INTO stores (name, address, lat, lon, radius_m, active)
+                    VALUES (%s, %s, %s, %s, %s, TRUE)
+                    ON CONFLICT (name) DO UPDATE SET
+                      address = EXCLUDED.address,
+                      lat = EXCLUDED.lat,
+                      lon = EXCLUDED.lon
+                    ;
+                """, (name, address, lat, lon, radius))
+
+            # Backfill store_id for legacy rows based on note matching store name
+            # (keeps old data showing up in Store Production)
+            cur.execute("""
+                UPDATE sales_entries se
+                SET store_id = s.id
+                FROM stores s
+                WHERE (se.store_id IS NULL OR se.store_id = 0)
+                  AND se.note = s.name;
+            """)
+
         conn.commit()
 
 
@@ -185,7 +277,7 @@ def clamp(n, lo, hi):
     return max(lo, min(hi, n))
 
 
-def parse_week_start(s: str | None) -> date | None:
+def parse_week_start(s):
     if not s:
         return None
     try:
@@ -199,25 +291,58 @@ def list_weeks() -> list[str]:
         with conn.cursor() as cur:
             cur.execute("SELECT DISTINCT week_start FROM sales_entries ORDER BY week_start DESC;")
             rows = cur.fetchall()
-    return [r[0].isoformat() for r in rows]
+    return [r["week_start"].isoformat() for r in rows]
+
+
+def get_week_goal_qty(week_start: date) -> int:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT goal_qty FROM weekly_goals WHERE week_start = %s;", (week_start,))
+            row = cur.fetchone()
+            if row:
+                return int(row["goal_qty"])
+            # create default row
+            cur.execute("""
+                INSERT INTO weekly_goals (week_start, goal_qty)
+                VALUES (%s, %s)
+                ON CONFLICT (week_start) DO NOTHING;
+            """, (week_start, int(DEFAULT_WEEKLY_GOAL)))
+        conn.commit()
+    return int(DEFAULT_WEEKLY_GOAL)
+
+
+def set_week_goal_qty(week_start: date, goal_qty: int):
+    goal_qty = int(goal_qty)
+    if goal_qty <= 0:
+        raise ValueError("goal must be positive")
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO weekly_goals (week_start, goal_qty)
+                VALUES (%s, %s)
+                ON CONFLICT (week_start) DO UPDATE SET
+                  goal_qty = EXCLUDED.goal_qty,
+                  updated_at = NOW();
+            """, (week_start, goal_qty))
+        conn.commit()
 
 
 def week_total(week_start: date) -> int:
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT COALESCE(SUM(qty), 0) FROM sales_entries WHERE week_start = %s;",
+                "SELECT COALESCE(SUM(qty), 0) AS total FROM sales_entries WHERE week_start = %s;",
                 (week_start,)
             )
-            (total,) = cur.fetchone()
-    return int(total or 0)
+            row = cur.fetchone()
+    return int(row["total"] or 0)
 
 
 def rep_totals_with_today(week_start: date, today_central: date) -> list[tuple[str, int, int]]:
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT rep, COALESCE(SUM(qty), 0) "
+                "SELECT rep, COALESCE(SUM(qty), 0) AS total "
                 "FROM sales_entries WHERE week_start = %s "
                 "GROUP BY rep;",
                 (week_start,)
@@ -225,15 +350,15 @@ def rep_totals_with_today(week_start: date, today_central: date) -> list[tuple[s
             week_rows = cur.fetchall()
 
             cur.execute(
-                "SELECT rep, COALESCE(SUM(qty), 0) "
+                "SELECT rep, COALESCE(SUM(qty), 0) AS total "
                 "FROM sales_entries WHERE week_start = %s AND created_at = %s "
                 "GROUP BY rep;",
                 (week_start, today_central)
             )
             today_rows = cur.fetchall()
 
-    week_map = {rep: int(total or 0) for rep, total in week_rows}
-    today_map = {rep: int(total or 0) for rep, total in today_rows}
+    week_map = {r["rep"]: int(r["total"] or 0) for r in week_rows}
+    today_map = {r["rep"]: int(r["total"] or 0) for r in today_rows}
 
     out = []
     for rep in REPS:
@@ -243,53 +368,168 @@ def rep_totals_with_today(week_start: date, today_central: date) -> list[tuple[s
     return out
 
 
-def store_totals_for_week(week_start: date) -> list[tuple[str, int]]:
+def get_stores(active_only=True):
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT note, COALESCE(SUM(qty), 0) "
-                "FROM sales_entries "
-                "WHERE week_start = %s "
-                "GROUP BY note;",
-                (week_start,)
-            )
+            if active_only:
+                cur.execute("SELECT * FROM stores WHERE active = TRUE ORDER BY name ASC;")
+            else:
+                cur.execute("SELECT * FROM stores ORDER BY name ASC;")
             rows = cur.fetchall()
+    return rows
 
-    totals = {}
-    for store, total in rows:
-        store = (store or "").strip()
-        if store:
-            totals[store] = int(total or 0)
 
-    out = [(s, totals.get(s, 0)) for s in STORE_LOCATIONS]
-    out.sort(key=lambda x: (-x[1], x[0].lower()))
-    return out
+def store_totals_for_week(week_start: date) -> list[tuple[str, int]]:
+    """
+    Store totals now come from store_id. Legacy entries are backfilled by init_db.
+    """
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT s.name AS store, COALESCE(SUM(se.qty), 0) AS total
+                FROM stores s
+                LEFT JOIN sales_entries se
+                  ON se.store_id = s.id AND se.week_start = %s
+                WHERE s.active = TRUE
+                GROUP BY s.name
+                ORDER BY total DESC, store ASC;
+            """, (week_start,))
+            rows = cur.fetchall()
+    return [(r["store"], int(r["total"] or 0)) for r in rows]
 
 
 def recent_entries(week_start: date, limit: int = 12) -> list[dict]:
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, rep, qty, created_at, COALESCE(note,'') "
-                "FROM sales_entries WHERE week_start = %s "
-                "ORDER BY id DESC LIMIT %s;",
-                (week_start, limit)
-            )
+            cur.execute("""
+                SELECT se.id, se.rep, se.qty, se.created_at,
+                       COALESCE(s.name, se.note, '') AS store_label,
+                       COALESCE(se.note,'') AS note,
+                       se.slack_channel, se.slack_ts
+                FROM sales_entries se
+                LEFT JOIN stores s ON s.id = se.store_id
+                WHERE se.week_start = %s
+                ORDER BY se.id DESC
+                LIMIT %s;
+            """, (week_start, limit))
             rows = cur.fetchall()
 
     out = []
-    for entry_id, rep, qty, created_at, note in rows:
+    for r in rows:
         out.append({
-            "id": int(entry_id),
-            "rep": rep,
-            "qty": int(qty),
-            "created_at": created_at.isoformat(),
-            "store": (note or ""),
+            "id": int(r["id"]),
+            "rep": r["rep"],
+            "qty": int(r["qty"]),
+            "created_at": r["created_at"].isoformat(),
+            "store": (r["store_label"] or ""),
+            "note": (r["note"] or ""),
+            "slack_channel": (r["slack_channel"] or ""),
+            "slack_ts": (r["slack_ts"] or ""),
         })
     return out
 
 
-def add_entry(week_start: date, rep: str, qty: int, store_location: str):
+# ---------------- GPS / Geofence ----------------
+GPS_MAX_AGE_SECONDS = 10 * 60        # sale must have a location ping within last 10 minutes
+GPS_MAX_ACCURACY_M = 120             # if accuracy is worse than this, we don't "lock" store
+DEFAULT_RADIUS_M = 180               # per-store default seeded above
+
+
+def haversine_m(lat1, lon1, lat2, lon2) -> float:
+    """
+    Distance in meters between two lat/lon points.
+    """
+    R = 6371000.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2) + math.cos(p1) * math.cos(p2) * (math.sin(dlon / 2) ** 2)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+def resolve_store(lat: float, lon: float):
+    """
+    Returns (store_row, distance_m) if inside a store geofence, else (None, None).
+    Chooses the nearest store among those where distance <= radius_m.
+    """
+    stores = get_stores(active_only=True)
+    best = None
+    best_d = None
+    for s in stores:
+        d = haversine_m(lat, lon, float(s["lat"]), float(s["lon"]))
+        if d <= float(s["radius_m"]):
+            if best is None or d < best_d:
+                best = s
+                best_d = d
+    return best, best_d
+
+
+def gps_is_fresh_and_locked() -> bool:
+    """
+    True if we have a store_id in session AND last gps ping is recent AND accuracy ok.
+    """
+    store_id = session.get("store_id")
+    gps_ts = session.get("gps_ts")
+    acc = session.get("gps_accuracy_m")
+    if not store_id or not gps_ts or acc is None:
+        return False
+    if (now_ts() - float(gps_ts)) > GPS_MAX_AGE_SECONDS:
+        return False
+    try:
+        acc_val = float(acc)
+    except Exception:
+        return False
+    if acc_val > GPS_MAX_ACCURACY_M:
+        return False
+    return True
+
+
+def get_session_store_label():
+    store_name = session.get("store_name") or ""
+    return store_name
+
+
+# ---------------- Slack posting (fool-proof method) ----------------
+def slack_post_sale(rep: str, qty: int, store_name: str, week_start: date):
+    """
+    Posts a standardized message to Slack.
+    Returns (channel_id, ts) if successful, else (None, None).
+    """
+    if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID or requests is None:
+        return None, None
+
+    # Standard, machine-readable prefix so you can recognize bot posts:
+    # APP|sale|rep=Tristan|qty=3|store=Costco - Manchester|week=2026-02-09
+    prefix = f"APP|sale|rep={rep}|qty={qty}|store={store_name}|week={week_start.isoformat()}"
+    human = f"*{rep}* logged *{qty}* Primo water sale(s) at *{store_name}* ✅"
+
+    text = f"{human}\n`{prefix}`"
+
+    url = "https://slack.com/api/chat.postMessage"
+    headers = {
+        "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    payload = {"channel": SLACK_CHANNEL_ID, "text": text}
+
+    try:
+        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
+        data = r.json()
+        if not data.get("ok"):
+            return None, None
+        return data.get("channel"), data.get("ts")
+    except Exception:
+        return None, None
+
+
+# ---------------- CRUD ----------------
+def add_entry_gps(week_start: date, rep: str, qty: int):
+    """
+    Add a sale from the website using GPS-locked store in session.
+    This is the "fool-proof" path.
+    """
     qty = int(qty)
     if qty <= 0:
         raise ValueError("qty must be positive")
@@ -298,64 +538,91 @@ def add_entry(week_start: date, rep: str, qty: int, store_location: str):
     if rep not in REPS:
         raise ValueError("invalid rep")
 
-    store_location = (store_location or "").strip()
-    if store_location not in STORE_LOCATIONS:
-        raise ValueError("invalid store location")
+    if not gps_is_fresh_and_locked():
+        raise ValueError("GPS not locked")
+
+    store_id = int(session.get("store_id"))
+    store_name = session.get("store_name") or ""
+    lat = session.get("gps_lat")
+    lon = session.get("gps_lon")
+    acc = session.get("gps_accuracy_m")
 
     created_date = local_today()
 
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO sales_entries (week_start, rep, qty, created_at, note) "
-                "VALUES (%s, %s, %s, %s, %s);",
-                (week_start, rep, qty, created_date, store_location)
-            )
+            cur.execute("""
+                INSERT INTO sales_entries (week_start, rep, qty, created_at, note, store_id, lat, lon, accuracy_m)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id;
+            """, (week_start, rep, qty, created_date, store_name, store_id, lat, lon, acc))
+            row = cur.fetchone()
+            entry_id = int(row["id"])
+
+        conn.commit()
+
+    # Post to Slack and link message -> entry (so deletes can reverse if needed)
+    channel_id, ts = slack_post_sale(rep, qty, store_name, week_start)
+    if channel_id and ts:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE sales_entries
+                    SET slack_channel=%s, slack_ts=%s
+                    WHERE id=%s;
+                """, (channel_id, ts, entry_id))
+
+                cur.execute("""
+                    INSERT INTO slack_message_sales (channel_id, message_ts, entry_id, rep, qty)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING;
+                """, (channel_id, ts, entry_id, rep, qty))
+            conn.commit()
+
+    return entry_id, bool(channel_id and ts)
+
+
+def delete_entry(entry_id: int):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM sales_entries WHERE id = %s;", (int(entry_id),))
         conn.commit()
 
 
-def add_sale_from_slack(week_start: date, rep: str, channel_id: str, message_ts: str, qty: int = 1):
-    """
-    Adds a sale for a Slack top-level post and saves a mapping so deletes can remove it later.
-    Ignores duplicates by (channel_id, message_ts).
-    """
+def update_entry(entry_id: int, qty: int, store_id: int | None):
     qty = int(qty)
     if qty <= 0:
         raise ValueError("qty must be positive")
-    if rep not in REPS:
-        raise ValueError("invalid rep")
 
-    created_date = local_today()
+    # validate store
+    if store_id is not None:
+        store_id = int(store_id)
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, name FROM stores WHERE id=%s;", (store_id,))
+                s = cur.fetchone()
+                if not s:
+                    raise ValueError("invalid store")
+        store_name = s["name"]
+    else:
+        store_name = ""
 
     with db_conn() as conn:
         with conn.cursor() as cur:
-            # If we already recorded this exact Slack message, do nothing
-            cur.execute(
-                "SELECT entry_id FROM slack_message_sales WHERE channel_id = %s AND message_ts = %s;",
-                (channel_id, message_ts)
-            )
-            row = cur.fetchone()
-            if row:
-                return
-
-            cur.execute(
-                "INSERT INTO sales_entries (week_start, rep, qty, created_at, note) "
-                "VALUES (%s, %s, %s, %s, %s) RETURNING id;",
-                (week_start, rep, qty, created_date, "Slack")
-            )
-            (entry_id,) = cur.fetchone()
-
-            cur.execute(
-                "INSERT INTO slack_message_sales (channel_id, message_ts, entry_id, rep, qty) "
-                "VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING;",
-                (channel_id, message_ts, int(entry_id), rep, qty)
-            )
+            cur.execute("""
+                UPDATE sales_entries
+                SET qty=%s,
+                    store_id=%s,
+                    note=%s
+                WHERE id=%s;
+            """, (qty, store_id, store_name, int(entry_id)))
         conn.commit()
 
 
 def remove_sale_from_slack(channel_id: str, message_ts: str):
     """
-    If a Slack post that counted is deleted, remove the associated sales entry.
+    If a Slack bot post that corresponds to a sale is deleted,
+    remove the associated sales entry.
     """
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -366,9 +633,9 @@ def remove_sale_from_slack(channel_id: str, message_ts: str):
             row = cur.fetchone()
             if not row:
                 return False
-            (entry_id,) = row
+            entry_id = int(row["entry_id"])
 
-            cur.execute("DELETE FROM sales_entries WHERE id = %s;", (int(entry_id),))
+            cur.execute("DELETE FROM sales_entries WHERE id = %s;", (entry_id,))
             cur.execute(
                 "DELETE FROM slack_message_sales WHERE channel_id = %s AND message_ts = %s;",
                 (channel_id, message_ts)
@@ -377,56 +644,6 @@ def remove_sale_from_slack(channel_id: str, message_ts: str):
     return True
 
 
-def delete_entry(entry_id: int):
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM sales_entries WHERE id = %s;", (int(entry_id),))
-        conn.commit()
-
-
-def update_entry(entry_id: int, qty: int, store_location: str):
-    qty = int(qty)
-    if qty <= 0:
-        raise ValueError("qty must be positive")
-
-    store_location = (store_location or "").strip()
-    if store_location != "Slack" and store_location not in STORE_LOCATIONS:
-        raise ValueError("invalid store")
-
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE sales_entries SET qty = %s, note = %s WHERE id = %s;",
-                (qty, store_location, int(entry_id))
-            )
-        conn.commit()
-
-
-def undo_last_entry(week_start: date):
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, rep, qty FROM sales_entries WHERE week_start = %s "
-                "ORDER BY id DESC LIMIT 1;",
-                (week_start,)
-            )
-            row = cur.fetchone()
-            if row is None:
-                return None
-            entry_id, rep, qty = row
-            cur.execute("DELETE FROM sales_entries WHERE id = %s;", (entry_id,))
-        conn.commit()
-    return {"id": int(entry_id), "rep": rep, "qty": int(qty)}
-
-
-def reset_week(week_start: date):
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM sales_entries WHERE week_start = %s;", (week_start,))
-        conn.commit()
-
-
-# ---------------- Slack helpers ----------------
 def slack_verify_request(req) -> bool:
     if not SLACK_SIGNING_SECRET:
         return False
@@ -653,7 +870,6 @@ LOGIN_PAGE = """<!DOCTYPE html>
 """
 
 
-# ✅ Realistic Slack logo SVG (inline)
 SLACK_SVG = """
 <svg viewBox="0 0 24 24" aria-hidden="true">
   <path fill="#E01E5A" d="M6.1 13.6a1.9 1.9 0 1 1-1.9-1.9h1.9v1.9Z"/>
@@ -686,6 +902,8 @@ HTML_PAGE = f"""
       --shadow:0 14px 34px rgba(0,0,0,.12);
       --primary:#2563eb; --danger:#ef4444;
       --focus: rgba(37,99,235,.20);
+      --ok: rgba(34,197,94,.12);
+      --warn: rgba(245,158,11,.14);
     }}
     *{{ box-sizing:border-box; }}
     body{{
@@ -716,6 +934,8 @@ HTML_PAGE = f"""
       border: 1px solid rgba(15,23,42,.08); color: rgba(15,23,42,.82);
       font-size: 11px; white-space: nowrap; font-weight: 900;
     }}
+    .pill.ok{{ background: var(--ok); border-color: rgba(34,197,94,.22); }}
+    .pill.warn{{ background: var(--warn); border-color: rgba(245,158,11,.25); }}
     .logout{{
       text-decoration:none; font-weight: 950; font-size: 12px; color: rgba(15,23,42,.72);
       padding: 6px 10px; border-radius: 999px; border: 1px solid rgba(15,23,42,.10);
@@ -758,6 +978,7 @@ HTML_PAGE = f"""
       cursor:pointer; font-weight: 950; font-size: 14px; transition: transform .08s ease; text-decoration:none; color: inherit;
       display:flex; align-items:center; justify-content:center; gap:8px; white-space: nowrap; width: 100%; }}
     button:hover, a.btn:hover{{ transform: translateY(-1px); }}
+    button:disabled{{ opacity: .55; cursor: not-allowed; transform:none; }}
     .btn-primary{{ background: linear-gradient(180deg, rgba(37,99,235,.95), rgba(29,78,216,.95)); color: white;
       border-color: rgba(29,78,216,.25); box-shadow: 0 10px 16px rgba(37,99,235,.14); }}
     .btn-danger{{ background: rgba(239,68,68,.12); border-color: rgba(239,68,68,.25); color: rgba(127,29,29,.95); }}
@@ -809,6 +1030,7 @@ HTML_PAGE = f"""
       </div>
 
       <div class="topActions">
+        <div id="storePill" class="pill warn">Store: <b id="storePillText">Detecting…</b></div>
         <div class="pill">Week: <b>{{{{ range_label }}}}</b></div>
         <div class="pill">Total: <b>{{{{ weekly_sales }}}}</b></div>
         <div class="pill">Goal: <b>{{{{ goal }}}}</b></div>
@@ -977,11 +1199,11 @@ HTML_PAGE = f"""
           </form>
         </div>
 
-        {{% if admin %}}
-          <form method="POST" id="salesForm" class="controls" autocomplete="off">
-            <input type="hidden" name="week" value="{{{{ selected_week_start }}}}">
-
-            <div class="formGrid">
+        <!-- Rep form (GPS-based) -->
+        <form method="POST" id="salesForm" class="controls" autocomplete="off">
+          <input type="hidden" name="week" value="{{{{ selected_week_start }}}}">
+          <div class="formGrid">
+            {{% if admin %}}
               <div>
                 <select name="rep">
                   {{% for r in reps %}}
@@ -989,35 +1211,140 @@ HTML_PAGE = f"""
                   {{% endfor %}}
                 </select>
               </div>
-              <div>
-                <input type="number" id="salesInput" name="sales" placeholder="Quantity" min="1" step="1" required>
-              </div>
+            {{% else %}}
+              <input type="hidden" name="rep" value="{{{{ user_rep }}}}">
               <div class="span2">
-                <select name="store_location" required>
-                  {{% for s in stores %}}
-                    <option value="{{{{ s }}}}">{{{{ s }}}}</option>
-                  {{% endfor %}}
-                </select>
+                <div class="pill warn" style="width:100%; justify-content:space-between;">
+                  <span>GPS required:</span>
+                  <span id="gpsStatusText" style="font-weight:950;">Detecting…</span>
+                </div>
               </div>
+            {{% endif %}}
+            <div class="{{{{ 'span2' if admin else 'span2' }}}}">
+              <input type="number" id="salesInput" name="sales" placeholder="Quantity" min="1" step="1" required>
             </div>
+          </div>
 
-            <div class="btnRow">
-              <button type="submit" name="action" value="add" class="btn-primary span2">Add Sale</button>
-              <button type="submit" name="action" value="undo">Undo</button>
+          <div class="btnRow">
+            <button id="addBtn" type="submit" name="action" value="add" class="btn-primary span2">Add Sale</button>
+
+            {{% if admin %}}
               <button type="submit" name="action" value="reset" class="btn-danger"
                       onclick="return confirm('Reset this week\\'s total to 0?');">Reset</button>
               <a class="btn span2" href="{{{{ url_for('export_csv', week=selected_week_start) }}}}">Export CSV</a>
+            {{% else %}}
+              <a class="btn span2" href="{{{{ url_for('export_csv', week=selected_week_start) }}}}">Export CSV</a>
+            {{% endif %}}
+          </div>
+        </form>
+
+        {{% if admin %}}
+          <form method="POST" action="{{{{ url_for('admin_goal') }}}}" class="controls" style="margin-top:12px;">
+            <div class="sectionHead" style="margin:0 0 8px;">Admin — weekly goal</div>
+            <input type="hidden" name="week" value="{{{{ selected_week_start }}}}">
+            <div class="formGrid">
+              <div class="span2">
+                <input type="number" name="goal_qty" min="1" step="1" value="{{{{ goal }}}}" required>
+              </div>
+            </div>
+            <div class="btnRow">
+              <button class="btn-primary span2" type="submit">Save Goal</button>
             </div>
           </form>
-        {{% else %}}
-          <a class="btn" href="{{{{ url_for('export_csv', week=selected_week_start) }}}}">Export CSV</a>
+
+          <details class="manageDetails">
+            <summary>
+              Admin — manage entries (edit/delete)
+              <span class="chev">▼</span>
+            </summary>
+
+            <div class="manageWrap">
+              <table class="manageTable">
+                <thead>
+                  <tr>
+                    <th style="width: 70px;">ID</th>
+                    <th style="width: 120px;">Rep</th>
+                    <th style="width: 90px;">Qty</th>
+                    <th>Store</th>
+                    <th style="width: 120px;">Date</th>
+                    <th style="width: 170px;">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {{% if recent %}}
+                    {{% for e in recent %}}
+                      <tr>
+                        <td>{{{{ e.id }}}}</td>
+                        <td>{{{{ e.rep }}}}</td>
+                        <td>
+                          <form method="POST" action="{{{{ url_for('admin_update') }}}}" style="display:flex; gap:8px; align-items:center; margin:0;">
+                            <input type="hidden" name="week" value="{{{{ selected_week_start }}}}">
+                            <input type="hidden" name="entry_id" value="{{{{ e.id }}}}">
+                            <input class="mini" type="number" name="qty" value="{{{{ e.qty }}}}" min="1" step="1" style="max-width: 90px;">
+                        </td>
+                        <td>
+                            <select class="mini" name="store_id" style="max-width: 320px;">
+                              <option value="">(none)</option>
+                              {{% for s in stores %}}
+                                <option value="{{{{ s.id }}}}" {{% if e.store == s.name %}}selected{{% endif %}}>{{{{ s.name }}}}</option>
+                              {{% endfor %}}
+                            </select>
+                        </td>
+                        <td>{{{{ e.created_at }}}}</td>
+                        <td>
+                            <button class="btnSmall btn-primary" type="submit">Save</button>
+                          </form>
+                          <form method="POST" action="{{{{ url_for('admin_delete') }}}}" style="display:inline; margin:0;">
+                            <input type="hidden" name="week" value="{{{{ selected_week_start }}}}">
+                            <input type="hidden" name="entry_id" value="{{{{ e.id }}}}">
+                            <button class="btnSmall btn-danger" type="submit"
+                                    onclick="return confirm('Delete entry #{{{{ e.id }}}}?');">Delete</button>
+                          </form>
+                        </td>
+                      </tr>
+                    {{% endfor %}}
+                  {{% else %}}
+                    <tr><td colspan="6" style="color: rgba(15,23,42,.60); font-weight: 900;">No entries yet</td></tr>
+                  {{% endif %}}
+                </tbody>
+              </table>
+            </div>
+          </details>
+
+          <details class="manageDetails">
+            <summary>
+              Admin — store geofence radius (meters)
+              <span class="chev">▼</span>
+            </summary>
+            <div class="manageWrap">
+              <table class="manageTable">
+                <thead><tr><th>Store</th><th style="width:140px;">Radius (m)</th><th style="width:170px;">Action</th></tr></thead>
+                <tbody>
+                  {{% for s in stores %}}
+                    <tr>
+                      <td>{{{{ s.name }}}}<div style="color:rgba(15,23,42,.55); font-weight:850; font-size:12px;">{{{{ s.address }}}}</div></td>
+                      <td>
+                        <form method="POST" action="{{{{ url_for('admin_store_radius') }}}}" style="margin:0; display:flex; gap:8px; align-items:center;">
+                          <input type="hidden" name="store_id" value="{{{{ s.id }}}}">
+                          <input class="mini" type="number" name="radius_m" min="50" step="10" value="{{{{ s.radius_m }}}}">
+                      </td>
+                      <td>
+                          <button class="btnSmall btn-primary" type="submit">Save</button>
+                        </form>
+                      </td>
+                    </tr>
+                  {{% endfor %}}
+                </tbody>
+              </table>
+            </div>
+          </details>
         {{% endif %}}
 
         <div class="tables" style="margin-top: 12px;">
           <div class="tableCard">
             <div class="tableTitle">
               <div>Leaderboard</div>
-              <div class="slackIcon" title="Auto-updates from Slack" aria-label="Slack">{SLACK_SVG}</div>
+              <div class="slackIcon" title="Slack posts are generated by the app" aria-label="Slack">{SLACK_SVG}</div>
             </div>
             <div class="tableWrap">
               <table>
@@ -1046,7 +1373,7 @@ HTML_PAGE = f"""
           <div class="tableCard">
             <div class="tableTitle">
               <div>Store production</div>
-              <div class="slackIcon" title="Auto-updates from Slack" aria-label="Slack">{SLACK_SVG}</div>
+              <div class="slackIcon" title="Store determined by GPS geofence" aria-label="Slack">{SLACK_SVG}</div>
             </div>
             <div class="tableWrap">
               <table class="storeTable">
@@ -1065,68 +1392,6 @@ HTML_PAGE = f"""
           </div>
         </div>
 
-        {{% if admin %}}
-          <details class="manageDetails">
-            <summary>
-              Admin — manage entries (edit/delete)
-              <span class="chev">▼</span>
-            </summary>
-
-            <div class="manageWrap">
-              <table class="manageTable">
-                <thead>
-                  <tr>
-                    <th style="width: 70px;">ID</th>
-                    <th style="width: 120px;">Rep</th>
-                    <th style="width: 90px;">Qty</th>
-                    <th>Store/Source</th>
-                    <th style="width: 120px;">Date</th>
-                    <th style="width: 170px;">Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {{% if recent %}}
-                    {{% for e in recent %}}
-                      <tr>
-                        <td>{{{{ e.id }}}}</td>
-                        <td>{{{{ e.rep }}}}</td>
-                        <td>
-                          <form method="POST" action="{{{{ url_for('admin_update') }}}}" style="display:flex; gap:8px; align-items:center; margin:0;">
-                            <input type="hidden" name="week" value="{{{{ selected_week_start }}}}">
-                            <input type="hidden" name="entry_id" value="{{{{ e.id }}}}">
-                            <input class="mini" type="number" name="qty" value="{{{{ e.qty }}}}" min="1" step="1" style="max-width: 90px;">
-                        </td>
-                        <td>
-                            <select class="mini" name="store" style="max-width: 320px;">
-                              {{% set current = (e.store or '') %}}
-                              <option value="Slack" {{% if current == 'Slack' %}}selected{{% endif %}}>Slack</option>
-                              {{% for s in stores %}}
-                                <option value="{{{{ s }}}}" {{% if current == s %}}selected{{% endif %}}>{{{{ s }}}}</option>
-                              {{% endfor %}}
-                            </select>
-                        </td>
-                        <td>{{{{ e.created_at }}}}</td>
-                        <td>
-                            <button class="btnSmall btn-primary" type="submit">Save</button>
-                          </form>
-                          <form method="POST" action="{{{{ url_for('admin_delete') }}}}" style="display:inline; margin:0;">
-                            <input type="hidden" name="week" value="{{{{ selected_week_start }}}}">
-                            <input type="hidden" name="entry_id" value="{{{{ e.id }}}}">
-                            <button class="btnSmall btn-danger" type="submit"
-                                    onclick="return confirm('Delete entry #{{{{ e.id }}}}?');">Delete</button>
-                          </form>
-                        </td>
-                      </tr>
-                    {{% endfor %}}
-                  {{% else %}}
-                    <tr><td colspan="6" style="color: rgba(15,23,42,.60); font-weight: 900;">No entries yet</td></tr>
-                  {{% endif %}}
-                </tbody>
-              </table>
-            </div>
-          </details>
-        {{% endif %}}
-
         <footer>{{{{ version }}}}</footer>
       </div>
     </div>
@@ -1134,15 +1399,73 @@ HTML_PAGE = f"""
 
   <script>
   (function(){{
-    const form = document.getElementById('salesForm');
-    const input = document.getElementById('salesInput');
-    if (!form || !input) return;
-    form.addEventListener('click', (e) => {{
-      const btn = e.target.closest('button');
-      if (!btn) return;
-      input.required = (btn.value === 'add');
-      if (btn.value === 'add') input.focus();
-    }});
+    const storePill = document.getElementById('storePill');
+    const storeText = document.getElementById('storePillText');
+    const gpsStatusText = document.getElementById('gpsStatusText');
+    const addBtn = document.getElementById('addBtn');
+
+    function setPill(mode, text) {{
+      if (!storePill || !storeText) return;
+      storePill.classList.remove('ok','warn');
+      storePill.classList.add(mode);
+      storeText.textContent = text;
+    }}
+
+    function setGpsStatus(text, ok) {{
+      if (!gpsStatusText) return;
+      gpsStatusText.textContent = text;
+      if (addBtn) addBtn.disabled = !ok;
+    }}
+
+    async function pingLocation() {{
+      if (!navigator.geolocation) {{
+        setPill('warn', 'No GPS');
+        setGpsStatus('GPS not supported', false);
+        return;
+      }}
+
+      navigator.geolocation.getCurrentPosition(async (pos) => {{
+        const payload = {{
+          lat: pos.coords.latitude,
+          lon: pos.coords.longitude,
+          accuracy_m: pos.coords.accuracy
+        }};
+        try {{
+          const res = await fetch('/api/location/ping', {{
+            method: 'POST',
+            headers: {{ 'Content-Type': 'application/json' }},
+            body: JSON.stringify(payload)
+          }});
+          const data = await res.json();
+
+          if (data.ok && data.locked) {{
+            setPill('ok', data.store_name);
+            setGpsStatus('Locked ✅', true);
+          }} else {{
+            setPill('warn', data.store_name || 'Not in Costco');
+            setGpsStatus(data.reason || 'Move closer / improve GPS', false);
+          }}
+        }} catch (e) {{
+          setPill('warn', 'Ping failed');
+          setGpsStatus('Network error', false);
+        }}
+      }}, (err) => {{
+        setPill('warn', 'Location blocked');
+        setGpsStatus('Enable location permission', false);
+      }}, {{
+        enableHighAccuracy: true,
+        timeout: 8000,
+        maximumAge: 0
+      }});
+    }}
+
+    // Start ping immediately and re-ping every 2 minutes
+    pingLocation();
+    setInterval(pingLocation, 120000);
+
+    // If admin, don't disable button based on GPS (admin can still use it)
+    const isAdmin = {{ 'true' if admin else 'false' }};
+    if (isAdmin === 'true' && addBtn) addBtn.disabled = false;
   }})();
   </script>
 </body>
@@ -1167,6 +1490,7 @@ def login():
             if password != expected:
                 error = "Incorrect password."
             else:
+                session.clear()
                 session["logged_in"] = True
                 session["rep"] = username
                 return redirect(next_url)
@@ -1183,6 +1507,64 @@ def login():
 def logout():
     session.clear()
     return redirect(url_for("login"))
+
+
+@app.route("/api/location/ping", methods=["POST"])
+def api_location_ping():
+    gate = require_login()
+    if gate:
+        return gate
+
+    data = request.get_json(silent=True) or {}
+    try:
+        lat = float(data.get("lat"))
+        lon = float(data.get("lon"))
+        accuracy_m = float(data.get("accuracy_m"))
+    except Exception:
+        return jsonify({"ok": False, "locked": False, "reason": "Bad location payload"}), 400
+
+    # If accuracy is too poor, don't lock store
+    if accuracy_m > GPS_MAX_ACCURACY_M:
+        # still store raw location for troubleshooting
+        session["gps_lat"] = lat
+        session["gps_lon"] = lon
+        session["gps_accuracy_m"] = accuracy_m
+        session["gps_ts"] = now_ts()
+        session.pop("store_id", None)
+        session.pop("store_name", None)
+        return jsonify({
+            "ok": True,
+            "locked": False,
+            "store_name": None,
+            "reason": f"Low accuracy ({int(accuracy_m)}m). Try near window."
+        })
+
+    store, dist_m = resolve_store(lat, lon)
+    session["gps_lat"] = lat
+    session["gps_lon"] = lon
+    session["gps_accuracy_m"] = accuracy_m
+    session["gps_ts"] = now_ts()
+
+    if not store:
+        session.pop("store_id", None)
+        session.pop("store_name", None)
+        return jsonify({
+            "ok": True,
+            "locked": False,
+            "store_name": None,
+            "reason": "Not inside a tracked Costco geofence."
+        })
+
+    session["store_id"] = int(store["id"])
+    session["store_name"] = store["name"]
+
+    return jsonify({
+        "ok": True,
+        "locked": True,
+        "store_id": int(store["id"]),
+        "store_name": store["name"],
+        "distance_m": float(dist_m or 0)
+    })
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -1206,54 +1588,49 @@ def index():
     if request.method == "POST":
         action = request.form.get("action", "")
 
-        if not admin:
-            message = "Sales are pulled from Slack."
-            ok = False
-            return redirect(url_for("index", week=selected_wk_start.isoformat(), msg=message, ok="0"))
-
         if action == "reset":
-            reset_week(selected_wk_start)
-            message = "Reset complete. Weekly entries cleared."
-            ok = True
+            if not admin:
+                return redirect(url_for("index", week=selected_wk_start.isoformat(), msg="Admins only.", ok="0"))
+            with db_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM sales_entries WHERE week_start = %s;", (selected_wk_start,))
+                conn.commit()
+            return redirect(url_for("index", week=selected_wk_start.isoformat(), msg="Reset complete.", ok="1"))
 
-        elif action == "undo":
-            undone = undo_last_entry(selected_wk_start)
-            if undone:
-                message = f"Undid last entry: {undone['rep']} -{undone['qty']}."
-                ok = True
-            else:
-                message = "Nothing to undo yet."
-                ok = False
-
-        elif action == "add":
-            raw = (request.form.get("sales") or "").strip()
-            store_location = (request.form.get("store_location") or "").strip()
+        if action == "add":
             rep = (request.form.get("rep") or "").strip() or user_rep
+            raw = (request.form.get("sales") or "").strip()
             try:
                 qty = int(raw)
                 if qty <= 0:
-                    raise ValueError("qty must be positive")
-                add_entry(selected_wk_start, rep, qty, store_location)
-                message = f"Added {qty} sale(s) for {rep}."
-                ok = True
+                    raise ValueError()
+
+                # Admin can add without GPS if you want, but we keep it consistent:
+                if not admin and not gps_is_fresh_and_locked():
+                    return redirect(url_for("index", week=selected_wk_start.isoformat(),
+                                            msg="Enable location + be inside a Costco to add a sale.", ok="0"))
+
+                entry_id, slack_ok = add_entry_gps(selected_wk_start, rep, qty)
+
+                msg = f"Added {qty} sale(s) for {rep} at {get_session_store_label()}."
+                if not slack_ok:
+                    msg += " (Slack post not sent — check SLACK_BOT_TOKEN / SLACK_CHANNEL_ID.)"
+                return redirect(url_for("index", week=selected_wk_start.isoformat(), msg=msg, ok="1"))
             except Exception:
-                message = "For Add: enter a valid whole number > 0 and choose a store location."
-                ok = False
-        else:
-            message = "Unknown action."
-            ok = False
+                return redirect(url_for("index", week=selected_wk_start.isoformat(),
+                                        msg="Could not add sale. Qty must be >0 and GPS must be locked to a Costco.", ok="0"))
 
-        return redirect(url_for("index", week=selected_wk_start.isoformat(), msg=message, ok=("1" if ok else "0")))
+        return redirect(url_for("index", week=selected_wk_start.isoformat(), msg="Unknown action.", ok="0"))
 
+    goal_qty = get_week_goal_qty(selected_wk_start)
     weekly_sales = week_total(selected_wk_start)
-    fill_percentage = clamp((weekly_sales / WEEKLY_GOAL) * 100 if WEEKLY_GOAL else 0, 0, 100)
-    remaining = max(0, WEEKLY_GOAL - weekly_sales)
+    fill_percentage = clamp((weekly_sales / goal_qty) * 100 if goal_qty else 0, 0, 100)
+    remaining = max(0, goal_qty - weekly_sales)
 
     # Water fill mapping
     top_y = 64
     bottom_y = 388
     usable_h = bottom_y - top_y
-
     water_h = (fill_percentage / 100.0) * usable_h
     if fill_percentage <= 0:
         water_h = 0
@@ -1268,6 +1645,7 @@ def index():
     store_rows = store_totals_for_week(selected_wk_start)
     weeks = list_weeks()
     recent = recent_entries(selected_wk_start, limit=12) if admin else []
+    stores = get_stores(active_only=False)
 
     return render_template_string(
         HTML_PAGE,
@@ -1275,7 +1653,7 @@ def index():
         admin=admin,
         reps=REPS,
         weekly_sales=weekly_sales,
-        goal=WEEKLY_GOAL,
+        goal=goal_qty,
         fill_percentage=fill_percentage,
         remaining=remaining,
         water_h=water_h,
@@ -1291,8 +1669,52 @@ def index():
         store_rows=store_rows,
         recent=recent,
         version=APP_VERSION,
-        stores=STORE_LOCATIONS
+        stores=stores
     )
+
+
+@app.route("/admin/goal", methods=["POST"])
+def admin_goal():
+    gate = require_login()
+    if gate:
+        return gate
+    if not is_admin():
+        abort(403)
+
+    wk = parse_week_start(request.form.get("week"))
+    week_start = wk or get_week_start(local_today())
+    goal_qty = request.form.get("goal_qty") or ""
+
+    try:
+        set_week_goal_qty(week_start, int(goal_qty))
+        return redirect(url_for("index", week=week_start.isoformat(), msg="Weekly goal saved.", ok="1"))
+    except Exception:
+        return redirect(url_for("index", week=week_start.isoformat(), msg="Goal must be a whole number > 0.", ok="0"))
+
+
+@app.route("/admin/store-radius", methods=["POST"])
+def admin_store_radius():
+    gate = require_login()
+    if gate:
+        return gate
+    if not is_admin():
+        abort(403)
+
+    store_id = request.form.get("store_id") or ""
+    radius_m = request.form.get("radius_m") or ""
+    try:
+        store_id = int(store_id)
+        radius_m = int(radius_m)
+        if radius_m < 50 or radius_m > 1000:
+            raise ValueError()
+
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE stores SET radius_m=%s WHERE id=%s;", (radius_m, store_id))
+            conn.commit()
+        return redirect(url_for("index", msg="Store radius saved.", ok="1"))
+    except Exception:
+        return redirect(url_for("index", msg="Radius must be between 50 and 1000 meters.", ok="0"))
 
 
 @app.route("/admin/update", methods=["POST"])
@@ -1308,10 +1730,11 @@ def admin_update():
 
     entry_id = request.form.get("entry_id") or ""
     qty = request.form.get("qty") or ""
-    store = request.form.get("store") or ""
+    store_id = request.form.get("store_id") or ""
 
     try:
-        update_entry(int(entry_id), int(qty), store)
+        sid = int(store_id) if store_id.strip() else None
+        update_entry(int(entry_id), int(qty), sid)
         msg = "Saved changes."
         ok = "1"
     except Exception:
@@ -1357,18 +1780,30 @@ def export_csv():
 
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT week_start, rep, qty, COALESCE(note,''), created_at "
-                "FROM sales_entries WHERE week_start = %s ORDER BY id ASC;",
-                (week_start,)
-            )
+            cur.execute("""
+                SELECT se.week_start, se.rep, se.qty, COALESCE(s.name, se.note, '') AS store,
+                       se.created_at, se.lat, se.lon, se.accuracy_m
+                FROM sales_entries se
+                LEFT JOIN stores s ON s.id = se.store_id
+                WHERE se.week_start = %s
+                ORDER BY se.id ASC;
+            """, (week_start,))
             rows = cur.fetchall()
 
     output = io.StringIO()
     w = csv.writer(output)
-    w.writerow(["week_start", "rep", "qty", "store_location", "date"])
-    for week_s, rep, qty, store, created in rows:
-        w.writerow([week_s.isoformat(), rep, int(qty), store, created.isoformat()])
+    w.writerow(["week_start", "rep", "qty", "store", "date", "lat", "lon", "accuracy_m"])
+    for r in rows:
+        w.writerow([
+            r["week_start"].isoformat(),
+            r["rep"],
+            int(r["qty"]),
+            r["store"],
+            r["created_at"].isoformat(),
+            r["lat"],
+            r["lon"],
+            r["accuracy_m"],
+        ])
 
     csv_bytes = output.getvalue().encode("utf-8")
     filename = f"primo_sales_{week_start.isoformat()}.csv"
@@ -1379,17 +1814,16 @@ def export_csv():
     )
 
 
-# ---------------- SLACK EVENTS ----------------
+# ---------------- SLACK EVENTS (delete protection) ----------------
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
-    # Parse JSON safely
     payload = request.get_json(silent=True) or {}
 
     # Slack URL verification
     if payload.get("type") == "url_verification":
         return jsonify({"challenge": payload.get("challenge", "")})
 
-    # Verify signature for real events
+    # Verify signature
     if not slack_verify_request(request):
         return Response("invalid signature", status=403)
 
@@ -1406,22 +1840,21 @@ def slack_events():
     event = payload.get("event", {}) or {}
     channel_id = (event.get("channel") or "").strip()
 
-    # Only count from your specific channel
+    # Only watch the configured channel (if set)
     if SLACK_CHANNEL_ID and channel_id != SLACK_CHANNEL_ID:
         mark_slack_event_processed(event_id)
         return Response("ok", status=200)
 
     subtype = event.get("subtype")
 
-    # ✅ Ignore edits entirely
+    # Ignore edits
     if subtype == "message_changed":
         mark_slack_event_processed(event_id)
         return Response("ok", status=200)
 
-    # ✅ If a message was deleted: remove the sale IF it was previously counted
+    # If a Slack message was deleted, remove the sale linked to that Slack message
     if subtype == "message_deleted":
         deleted_ts = (event.get("deleted_ts") or "").strip()
-        # Sometimes Slack also includes previous_message
         if not deleted_ts:
             prev = event.get("previous_message") or {}
             deleted_ts = (prev.get("ts") or "").strip()
@@ -1432,41 +1865,7 @@ def slack_events():
         mark_slack_event_processed(event_id)
         return Response("ok", status=200)
 
-    # Only handle new messages (top-level posts)
-    if event.get("type") != "message":
-        mark_slack_event_processed(event_id)
-        return Response("ok", status=200)
-
-    # Ignore any other subtypes (bot_message, etc.)
-    if subtype:
-        mark_slack_event_processed(event_id)
-        return Response("ok", status=200)
-
-    user = (event.get("user") or "").strip()
-    text = (event.get("text") or "")
-    ts = (event.get("ts") or "").strip()
-
-    # ✅ Only Tristan/Ricky/Sohaib
-    rep = SLACK_USER_TO_REP.get(user)
-    if not rep:
-        mark_slack_event_processed(event_id)
-        return Response("ok", status=200)
-
-    # ✅ Only count if contains "water"
-    if "water" not in text.lower():
-        mark_slack_event_processed(event_id)
-        return Response("ok", status=200)
-
-    # ✅ Only count if it is a top-level post (NOT a comment/thread reply)
-    # Thread replies have thread_ts != ts
-    thread_ts = (event.get("thread_ts") or "").strip()
-    if thread_ts and thread_ts != ts:
-        mark_slack_event_processed(event_id)
-        return Response("ok", status=200)
-
-    wk_start = get_week_start(local_today())
-    add_sale_from_slack(wk_start, rep, channel_id, ts, qty=1)
-
+    # We do NOT create sales from Slack messages anymore (fool-proof method uses GPS+app posting)
     mark_slack_event_processed(event_id)
     return Response("ok", status=200)
 
@@ -1478,17 +1877,20 @@ def db_status():
 
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM sales_entries;")
-            (count,) = cur.fetchone()
-            cur.execute("SELECT current_database(), current_user;")
-            dbname, dbuser = cur.fetchone()
+            cur.execute("SELECT COUNT(*) AS c FROM sales_entries;")
+            row = cur.fetchone()
+            count = int(row["c"])
+            cur.execute("SELECT current_database() AS db, current_user AS u;")
+            row2 = cur.fetchone()
 
     return {
         "ok": True,
-        "database": dbname,
-        "user": dbuser,
+        "database": row2["db"],
+        "user": row2["u"],
         "rows_in_sales_entries": int(count),
         "central_today": local_today().isoformat(),
+        "gps_max_age_seconds": GPS_MAX_AGE_SECONDS,
+        "gps_max_accuracy_m": GPS_MAX_ACCURACY_M,
     }
 
 
@@ -1496,7 +1898,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     init_db()
     app.run(host="0.0.0.0", port=port)
-
 
 
 
