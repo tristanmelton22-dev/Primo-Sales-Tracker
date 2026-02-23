@@ -38,17 +38,16 @@ app = Flask(__name__)
 
 # ---------------- CONFIG ----------------
 DEFAULT_WEEKLY_GOAL = 50
-APP_VERSION = "V0.8"  # ✅ bumped
+APP_VERSION = "V0.9"  # ✅ bumped (GPS removed + admin rep mgmt + daily location)
 
-REPS = ["Tristan", "Ricky", "Sohaib"]
-ADMIN_REP = "Tristan"
-DEFAULT_REP = REPS[0] if REPS else "Rep"
+# IMPORTANT:
+# Admin is now stored in DB. We seed a default admin user on first run.
+DEFAULT_ADMIN_USERNAME = os.environ.get("DEFAULT_ADMIN_USERNAME", "Tristan").strip() or "Tristan"
+DEFAULT_ADMIN_PASSWORD = os.environ.get("DEFAULT_ADMIN_PASSWORD", "Primo1234!").strip() or "Primo1234!"
 
-USER_PASSWORDS = {
-    "Tristan": "Primo1234!",
-    "Ricky": "Primo123!",
-    "Sohaib": "Primo123!",
-}
+# Optional seeds for reps (comma-separated)
+# e.g. "Tristan,Ricky,Sohaib"
+SEED_REPS = os.environ.get("SEED_REPS", "Tristan,Ricky,Sohaib")
 
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 
@@ -59,14 +58,12 @@ if not DATABASE_URL:
     )
 
 # ---------------- SLACK CONFIG ----------------
-# Incoming events verification (optional but recommended)
 SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET", "").strip()
 SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "").strip()
-
-# Bot posting (for fool-proof method)
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
 
-# Keep these for mapping Slack user -> rep only if you still want to accept some Slack-based behavior.
+# Keep these only if you still want to support delete protection mapping (you do).
+# Slack user -> rep mapping isn't used to create sales anymore.
 SLACK_TRISTAN_ID = os.environ.get("SLACK_TRISTAN_ID", "").strip()
 SLACK_RICKY_ID = os.environ.get("SLACK_RICKY_ID", "").strip()
 SLACK_SOHAIB_ID = os.environ.get("SLACK_SOHAIB_ID", "").strip()
@@ -106,19 +103,69 @@ def db_conn():
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
+# ---------------- Password hashing ----------------
+def _pw_salt() -> bytes:
+    # A stable salt source; SECRET_KEY must be stable across deploys.
+    # (Not ideal cryptography, but MUCH better than plain-text in code.)
+    return (app.secret_key or "dev-secret-change-me").encode("utf-8")
+
+
+def hash_password(password: str) -> str:
+    password = (password or "").encode("utf-8")
+    dk = hashlib.pbkdf2_hmac("sha256", password, _pw_salt(), 150_000)
+    return dk.hex()
+
+
+def verify_password(password: str, expected_hash_hex: str) -> bool:
+    try:
+        got = hash_password(password)
+        return hmac.compare_digest(got, expected_hash_hex or "")
+    except Exception:
+        return False
+
+
 def init_db():
     """
     Creates/updates DB schema safely.
-    Includes:
-      - stores table with Costco geofences
-      - weekly goals table (per week_start)
-      - sales_entries store-aware columns
-      - slack mapping for delete/undo if slack message removed
-      - event dedupe table (optional)
+    Adds:
+      - reps table (auth + admin role + active flag)
+      - rep_day_locations (admin sets "rep location" per day)
+    Keeps your existing:
+      - stores table
+      - weekly_goals table
+      - sales_entries table
+      - slack tables for delete protection
     """
     with db_conn() as conn:
         with conn.cursor() as cur:
-            # Stores (geofences)
+            # ---------------- Reps ----------------
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS reps (
+                    id BIGSERIAL PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+                    active BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_reps_active ON reps(active);")
+
+            # Daily rep location (manual, set by admin)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS rep_day_locations (
+                    rep_id BIGINT NOT NULL REFERENCES reps(id) ON DELETE CASCADE,
+                    work_date DATE NOT NULL,
+                    location_text TEXT NOT NULL DEFAULT '',
+                    updated_by BIGINT NULL REFERENCES reps(id),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (rep_id, work_date)
+                );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_rep_day_locations_date ON rep_day_locations(work_date);")
+
+            # ---------------- Stores ----------------
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS stores (
                     id BIGSERIAL PRIMARY KEY,
@@ -192,8 +239,7 @@ def init_db():
                 WHERE slack_channel IS NOT NULL AND slack_channel <> '' AND slack_ts IS NOT NULL AND slack_ts <> '';
             """)
 
-            # Seed Costco stores (lat/lon hardcoded; admin can tweak radius)
-            # These coordinates are used purely for geofencing; you can adjust if needed.
+            # Seed Costco stores (kept; now store selection is manual)
             seed_stores = [
                 ("Costco - University City", "8685 Olive Blvd, Saint Louis, MO 63132",
                  38.6762657, -90.3590698, 180),
@@ -216,7 +262,6 @@ def init_db():
                 """, (name, address, lat, lon, radius))
 
             # Backfill store_id for legacy rows based on note matching store name
-            # (keeps old data showing up in Store Production)
             cur.execute("""
                 UPDATE sales_entries se
                 SET store_id = s.id
@@ -224,6 +269,35 @@ def init_db():
                 WHERE (se.store_id IS NULL OR se.store_id = 0)
                   AND se.note = s.name;
             """)
+
+            # ---------------- Seed reps ----------------
+            # 1) Ensure admin exists
+            cur.execute("SELECT id FROM reps WHERE username=%s;", (DEFAULT_ADMIN_USERNAME,))
+            admin_row = cur.fetchone()
+            if not admin_row:
+                cur.execute("""
+                    INSERT INTO reps (username, password_hash, is_admin, active)
+                    VALUES (%s, %s, TRUE, TRUE);
+                """, (DEFAULT_ADMIN_USERNAME, hash_password(DEFAULT_ADMIN_PASSWORD)))
+
+            # 2) Seed additional reps (active, non-admin) if missing
+            seed_list = [x.strip() for x in (SEED_REPS or "").split(",") if x.strip()]
+            # if seed includes admin, keep admin admin
+            for uname in seed_list:
+                cur.execute("SELECT id, is_admin FROM reps WHERE username=%s;", (uname,))
+                r = cur.fetchone()
+                if not r:
+                    # default password for seeded reps (change in admin UI)
+                    default_pw = "Primo123!"
+                    is_admin = (uname == DEFAULT_ADMIN_USERNAME)
+                    cur.execute("""
+                        INSERT INTO reps (username, password_hash, is_admin, active)
+                        VALUES (%s, %s, %s, TRUE);
+                    """, (uname, hash_password(DEFAULT_ADMIN_PASSWORD if is_admin else default_pw), bool(is_admin)))
+                else:
+                    # if it's the admin username but not admin in DB, fix it
+                    if uname == DEFAULT_ADMIN_USERNAME and not bool(r["is_admin"]):
+                        cur.execute("UPDATE reps SET is_admin=TRUE WHERE username=%s;", (uname,))
 
         conn.commit()
 
@@ -243,21 +317,59 @@ def ensure_db():
 
 # ---------------- Auth / Roles ----------------
 def is_logged_in() -> bool:
-    return bool(session.get("logged_in")) and bool(session.get("rep"))
+    return bool(session.get("logged_in")) and bool(session.get("rep_id"))
 
 
-def current_rep() -> str:
-    return session.get("rep") or DEFAULT_REP
+def current_rep_id() -> int | None:
+    rid = session.get("rep_id")
+    try:
+        return int(rid) if rid is not None else None
+    except Exception:
+        return None
+
+
+def current_rep_name() -> str:
+    return session.get("rep_name") or ""
 
 
 def is_admin() -> bool:
-    return current_rep() == ADMIN_REP
+    return bool(session.get("is_admin"))
 
 
 def require_login():
     if not is_logged_in():
         return redirect(url_for("login", next=request.path))
     return None
+
+
+def get_rep_by_username(username: str):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, username, password_hash, is_admin, active
+                FROM reps
+                WHERE username=%s;
+            """, ((username or "").strip(),))
+            return cur.fetchone()
+
+
+def list_reps(active_only=True):
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            if active_only:
+                cur.execute("""
+                    SELECT id, username, is_admin, active
+                    FROM reps
+                    WHERE active=TRUE
+                    ORDER BY is_admin DESC, username ASC;
+                """)
+            else:
+                cur.execute("""
+                    SELECT id, username, is_admin, active
+                    FROM reps
+                    ORDER BY is_admin DESC, active DESC, username ASC;
+                """)
+            return cur.fetchall()
 
 
 # ---------------- Business logic ----------------
@@ -339,6 +451,8 @@ def week_total(week_start: date) -> int:
 
 
 def rep_totals_with_today(week_start: date, today_central: date) -> list[tuple[str, int, int]]:
+    reps = [r["username"] for r in list_reps(active_only=True)]
+
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -361,7 +475,7 @@ def rep_totals_with_today(week_start: date, today_central: date) -> list[tuple[s
     today_map = {r["rep"]: int(r["total"] or 0) for r in today_rows}
 
     out = []
-    for rep in REPS:
+    for rep in reps:
         out.append((rep, week_map.get(rep, 0), today_map.get(rep, 0)))
 
     out.sort(key=lambda x: (-x[1], -x[2], x[0].lower()))
@@ -380,9 +494,6 @@ def get_stores(active_only=True):
 
 
 def store_totals_for_week(week_start: date) -> list[tuple[str, int]]:
-    """
-    Store totals now come from store_id. Legacy entries are backfilled by init_db.
-    """
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -429,69 +540,58 @@ def recent_entries(week_start: date, limit: int = 12) -> list[dict]:
     return out
 
 
-# ---------------- GPS / Geofence ----------------
-GPS_MAX_AGE_SECONDS = 10 * 60        # sale must have a location ping within last 10 minutes
-GPS_MAX_ACCURACY_M = 120             # if accuracy is worse than this, we don't "lock" store
-DEFAULT_RADIUS_M = 180               # per-store default seeded above
+# ---------------- Daily Rep Location (Admin manual) ----------------
+def get_rep_location_for_day(rep_id: int, work_date: date) -> str:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT location_text
+                FROM rep_day_locations
+                WHERE rep_id=%s AND work_date=%s;
+            """, (int(rep_id), work_date))
+            row = cur.fetchone()
+            return (row["location_text"] if row else "") or ""
 
 
-def haversine_m(lat1, lon1, lat2, lon2) -> float:
+def set_rep_location_for_day(rep_id: int, work_date: date, location_text: str, updated_by: int | None):
+    loc = (location_text or "").strip()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO rep_day_locations (rep_id, work_date, location_text, updated_by)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (rep_id, work_date) DO UPDATE SET
+                  location_text=EXCLUDED.location_text,
+                  updated_by=EXCLUDED.updated_by,
+                  updated_at=NOW();
+            """, (int(rep_id), work_date, loc, int(updated_by) if updated_by else None))
+        conn.commit()
+
+
+def locations_for_day(work_date: date) -> dict[str, str]:
     """
-    Distance in meters between two lat/lon points.
+    Returns {username: location_text} for active reps.
     """
-    R = 6371000.0
-    p1 = math.radians(lat1)
-    p2 = math.radians(lat2)
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = (math.sin(dlat / 2) ** 2) + math.cos(p1) * math.cos(p2) * (math.sin(dlon / 2) ** 2)
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
+    reps = list_reps(active_only=True)
+    rep_ids = [int(r["id"]) for r in reps]
+    if not rep_ids:
+        return {}
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT r.username, COALESCE(l.location_text,'') AS location_text
+                FROM reps r
+                LEFT JOIN rep_day_locations l
+                  ON l.rep_id = r.id AND l.work_date = %s
+                WHERE r.active=TRUE
+                ORDER BY r.is_admin DESC, r.username ASC;
+            """, (work_date,))
+            rows = cur.fetchall()
+    return {row["username"]: (row["location_text"] or "") for row in rows}
 
 
-def resolve_store(lat: float, lon: float):
-    """
-    Returns (store_row, distance_m) if inside a store geofence, else (None, None).
-    Chooses the nearest store among those where distance <= radius_m.
-    """
-    stores = get_stores(active_only=True)
-    best = None
-    best_d = None
-    for s in stores:
-        d = haversine_m(lat, lon, float(s["lat"]), float(s["lon"]))
-        if d <= float(s["radius_m"]):
-            if best is None or d < best_d:
-                best = s
-                best_d = d
-    return best, best_d
-
-
-def gps_is_fresh_and_locked() -> bool:
-    """
-    True if we have a store_id in session AND last gps ping is recent AND accuracy ok.
-    """
-    store_id = session.get("store_id")
-    gps_ts = session.get("gps_ts")
-    acc = session.get("gps_accuracy_m")
-    if not store_id or not gps_ts or acc is None:
-        return False
-    if (now_ts() - float(gps_ts)) > GPS_MAX_AGE_SECONDS:
-        return False
-    try:
-        acc_val = float(acc)
-    except Exception:
-        return False
-    if acc_val > GPS_MAX_ACCURACY_M:
-        return False
-    return True
-
-
-def get_session_store_label():
-    store_name = session.get("store_name") or ""
-    return store_name
-
-
-# ---------------- Slack posting (fool-proof method) ----------------
+# ---------------- Slack posting (still supported) ----------------
 def slack_post_sale(rep: str, qty: int, store_name: str, week_start: date):
     """
     Posts a standardized message to Slack.
@@ -500,11 +600,8 @@ def slack_post_sale(rep: str, qty: int, store_name: str, week_start: date):
     if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID or requests is None:
         return None, None
 
-    # Standard, machine-readable prefix so you can recognize bot posts:
-    # APP|sale|rep=Tristan|qty=3|store=Costco - Manchester|week=2026-02-09
     prefix = f"APP|sale|rep={rep}|qty={qty}|store={store_name}|week={week_start.isoformat()}"
-    human = f"*{rep}* logged *{qty}* Primo water sale(s) at *{store_name}* ✅"
-
+    human = f"*{rep}* logged *{qty}* Primo water sale(s) at *{store_name or 'Unknown store'}* ✅"
     text = f"{human}\n`{prefix}`"
 
     url = "https://slack.com/api/chat.postMessage"
@@ -525,27 +622,30 @@ def slack_post_sale(rep: str, qty: int, store_name: str, week_start: date):
 
 
 # ---------------- CRUD ----------------
-def add_entry_gps(week_start: date, rep: str, qty: int):
-    """
-    Add a sale from the website using GPS-locked store in session.
-    This is the "fool-proof" path.
-    """
+def add_entry_manual(week_start: date, rep: str, qty: int, store_id: int | None):
     qty = int(qty)
     if qty <= 0:
         raise ValueError("qty must be positive")
 
-    rep = (rep or "").strip() or DEFAULT_REP
-    if rep not in REPS:
+    rep = (rep or "").strip()
+    if not rep:
+        raise ValueError("rep required")
+
+    # ensure rep is active (or allow historical reps?)
+    rep_names = [r["username"] for r in list_reps(active_only=True)]
+    if rep not in rep_names and not is_admin():
         raise ValueError("invalid rep")
 
-    if not gps_is_fresh_and_locked():
-        raise ValueError("GPS not locked")
-
-    store_id = int(session.get("store_id"))
-    store_name = session.get("store_name") or ""
-    lat = session.get("gps_lat")
-    lon = session.get("gps_lon")
-    acc = session.get("gps_accuracy_m")
+    store_name = ""
+    if store_id is not None:
+        store_id = int(store_id)
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, name FROM stores WHERE id=%s;", (store_id,))
+                s = cur.fetchone()
+                if not s:
+                    raise ValueError("invalid store")
+                store_name = s["name"]
 
     created_date = local_today()
 
@@ -553,15 +653,14 @@ def add_entry_gps(week_start: date, rep: str, qty: int):
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO sales_entries (week_start, rep, qty, created_at, note, store_id, lat, lon, accuracy_m)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, NULL, NULL, NULL)
                 RETURNING id;
-            """, (week_start, rep, qty, created_date, store_name, store_id, lat, lon, acc))
+            """, (week_start, rep, qty, created_date, store_name, store_id))
             row = cur.fetchone()
             entry_id = int(row["id"])
-
         conn.commit()
 
-    # Post to Slack and link message -> entry (so deletes can reverse if needed)
+    # Slack post + mapping (optional)
     channel_id, ts = slack_post_sale(rep, qty, store_name, week_start)
     if channel_id and ts:
         with db_conn() as conn:
@@ -594,7 +693,6 @@ def update_entry(entry_id: int, qty: int, store_id: int | None):
     if qty <= 0:
         raise ValueError("qty must be positive")
 
-    # validate store
     if store_id is not None:
         store_id = int(store_id)
         with db_conn() as conn:
@@ -620,10 +718,6 @@ def update_entry(entry_id: int, qty: int, store_id: int | None):
 
 
 def remove_sale_from_slack(channel_id: str, message_ts: str):
-    """
-    If a Slack bot post that corresponds to a sale is deleted,
-    remove the associated sales entry.
-    """
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -743,7 +837,6 @@ LOGIN_PAGE = """<!DOCTYPE html>
       color: rgba(15,23,42,.70);
       display:block; margin: 14px 0 6px;
     }
-
     .fieldRow{
       display:flex;
       gap:10px;
@@ -780,7 +873,6 @@ LOGIN_PAGE = """<!DOCTYPE html>
       box-shadow: 0 0 0 4px var(--focus);
       border-color: rgba(37,99,235,.55);
     }
-
     button.primary{
       width: 100%;
       margin-top: 14px;
@@ -823,7 +915,7 @@ LOGIN_PAGE = """<!DOCTYPE html>
       <div class="mark" aria-hidden="true"></div>
       <div>
         <h1>Primo Sales Tracker</h1>
-        <p>Login with your name + password.</p>
+        <p>Login with your username + password.</p>
       </div>
     </div>
 
@@ -1009,12 +1101,13 @@ HTML_PAGE = f"""
       text-transform: uppercase; letter-spacing: .04em; user-select:none; display:flex; align-items:center; justify-content:space-between; gap:10px; }}
     details.manageDetails > summary::-webkit-details-marker{{ display:none; }}
     .chev{{ font-size: 12px; color: rgba(15,23,42,.55); font-weight: 950; }}
-    .manageWrap{{ max-height: 260px; overflow: auto; }}
-    @media (max-width: 520px){{ .manageWrap{{ max-height: 320px; }} }}
+    .manageWrap{{ max-height: 320px; overflow: auto; }}
+    @media (max-width: 520px){{ .manageWrap{{ max-height: 380px; }} }}
     table.manageTable{{ min-width: 0 !important; width: 100% !important; table-layout: fixed; }}
     table.manageTable td, table.manageTable th{{ white-space: normal !important; }}
     .mini{{ height: 38px !important; font-size: 12px !important; font-weight: 850 !important; }}
-    .btnSmall{{ height: 38px !important; font-size: 12px !important; font-weight: 950 !important; padding: 0 10px !important; }}
+    .btnSmall{{ height: 38px !important; font-size: 12px !important; font-weight: 950 !important; padding: 0 10px !important; width:auto !important; }}
+    .rowActions{{ display:flex; gap:8px; flex-wrap:wrap; }}
     footer{{ margin-top: 10px; text-align:center; color: rgba(15,23,42,.55); font-weight: 900; font-size: 12px; padding: 6px 0 2px; }}
   </style>
 </head>
@@ -1030,7 +1123,7 @@ HTML_PAGE = f"""
       </div>
 
       <div class="topActions">
-        <div id="storePill" class="pill warn">Store: <b id="storePillText">Detecting…</b></div>
+        <div class="pill {{{{ 'ok' if today_location else 'warn' }}}}">Today location: <b>{{{{ today_location if today_location else 'Not set' }}}}</b></div>
         <div class="pill">Week: <b>{{{{ range_label }}}}</b></div>
         <div class="pill">Total: <b>{{{{ weekly_sales }}}}</b></div>
         <div class="pill">Goal: <b>{{{{ goal }}}}</b></div>
@@ -1199,7 +1292,7 @@ HTML_PAGE = f"""
           </form>
         </div>
 
-        <!-- Rep form (GPS-based) -->
+        <!-- Rep form (manual store selection, no GPS) -->
         <form method="POST" id="salesForm" class="controls" autocomplete="off">
           <input type="hidden" name="week" value="{{{{ selected_week_start }}}}">
           <div class="formGrid">
@@ -1207,7 +1300,7 @@ HTML_PAGE = f"""
               <div>
                 <select name="rep">
                   {{% for r in reps %}}
-                    <option value="{{{{ r }}}}" {{% if r == user_rep %}}selected{{% endif %}}>{{{{ r }}}}</option>
+                    <option value="{{{{ r.username }}}}" {{% if r.username == user_rep %}}selected{{% endif %}}>{{{{ r.username }}}}</option>
                   {{% endfor %}}
                 </select>
               </div>
@@ -1215,12 +1308,24 @@ HTML_PAGE = f"""
               <input type="hidden" name="rep" value="{{{{ user_rep }}}}">
               <div class="span2">
                 <div class="pill warn" style="width:100%; justify-content:space-between;">
-                  <span>GPS required:</span>
-                  <span id="gpsStatusText" style="font-weight:950;">Detecting…</span>
+                  <span>Store is manual now:</span>
+                  <span style="font-weight:950;">Select store below</span>
                 </div>
               </div>
             {{% endif %}}
-            <div class="{{{{ 'span2' if admin else 'span2' }}}}">
+
+            <div class="span2">
+              <select name="store_id" required>
+                <option value="" selected>Select store…</option>
+                {{% for s in stores %}}
+                  {{% if s.active %}}
+                    <option value="{{{{ s.id }}}}">{{{{ s.name }}}}</option>
+                  {{% endif %}}
+                {{% endfor %}}
+              </select>
+            </div>
+
+            <div class="span2">
               <input type="number" id="salesInput" name="sales" placeholder="Quantity" min="1" step="1" required>
             </div>
           </div>
@@ -1251,6 +1356,108 @@ HTML_PAGE = f"""
               <button class="btn-primary span2" type="submit">Save Goal</button>
             </div>
           </form>
+
+          <form method="POST" action="{{{{ url_for('admin_set_location') }}}}" class="controls" style="margin-top:12px;">
+            <div class="sectionHead" style="margin:0 0 8px;">Admin — set rep location for today</div>
+            <div class="formGrid">
+              <div>
+                <select name="rep_id" required>
+                  {{% for r in reps %}}
+                    <option value="{{{{ r.id }}}}">{{{{ r.username }}}}</option>
+                  {{% endfor %}}
+                </select>
+              </div>
+              <div>
+                <input type="text" name="location_text" placeholder="e.g. University City Costco" required>
+              </div>
+              <div class="span2">
+                <button class="btn-primary" type="submit">Save Today Location</button>
+              </div>
+            </div>
+            <div style="font-weight:850; color: rgba(15,23,42,.62); font-size:12px;">
+              Current (today): {{% for name, loc in today_locations.items() %}}
+                <span style="display:inline-block; margin-right:10px;"><b>{{{{ name }}}}:</b> {{{{ loc if loc else '—' }}}}</span>
+              {{% endfor %}}
+            </div>
+          </form>
+
+          <details class="manageDetails">
+            <summary>
+              Admin — manage reps (add/remove/reset password)
+              <span class="chev">▼</span>
+            </summary>
+
+            <div class="manageWrap" style="padding: 10px;">
+              <form method="POST" action="{{{{ url_for('admin_add_rep') }}}}" class="controls" style="margin:0;">
+                <div class="sectionHead" style="margin:0 0 8px;">Add rep</div>
+                <div class="formGrid">
+                  <div>
+                    <input type="text" name="username" placeholder="Username (e.g. NewRep)" required>
+                  </div>
+                  <div>
+                    <input type="text" name="password" placeholder="Temporary password" required>
+                  </div>
+                  <div class="span2">
+                    <label style="display:flex; gap:10px; align-items:center; margin:0; font-weight:900; font-size:12px; color:rgba(15,23,42,.70);">
+                      <input type="checkbox" name="is_admin" value="1" style="width:18px; height:18px;">
+                      Make admin
+                    </label>
+                  </div>
+                  <div class="span2">
+                    <button class="btn-primary" type="submit">Add Rep</button>
+                  </div>
+                </div>
+              </form>
+
+              <div style="height:10px;"></div>
+
+              <table class="manageTable">
+                <thead>
+                  <tr>
+                    <th>Rep</th>
+                    <th style="width:120px;">Role</th>
+                    <th style="width:120px;">Status</th>
+                    <th style="width:260px;">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {{% for r in reps_all %}}
+                    <tr>
+                      <td><b>{{{{ r.username }}}}</b></td>
+                      <td>{{{{ 'Admin' if r.is_admin else 'Rep' }}}}</td>
+                      <td>{{{{ 'Active' if r.active else 'Inactive' }}}}</td>
+                      <td>
+                        <div class="rowActions">
+                          <form method="POST" action="{{{{ url_for('admin_toggle_rep') }}}}" style="margin:0;">
+                            <input type="hidden" name="rep_id" value="{{{{ r.id }}}}">
+                            <input type="hidden" name="set_active" value="{{{{ '0' if r.active else '1' }}}}">
+                            <button class="btnSmall {{{{ 'btn-danger' if r.active else '' }}}}" type="submit"
+                              onclick="return confirm('{{{{ 'Deactivate' if r.active else 'Reactivate' }}}} {{{{ r.username }}}}?');">
+                              {{{{ 'Deactivate' if r.active else 'Reactivate' }}}}
+                            </button>
+                          </form>
+
+                          <form method="POST" action="{{{{ url_for('admin_reset_password') }}}}" style="margin:0; display:flex; gap:8px; align-items:center;">
+                            <input type="hidden" name="rep_id" value="{{{{ r.id }}}}">
+                            <input class="mini" type="text" name="new_password" placeholder="New password" required style="max-width: 160px;">
+                            <button class="btnSmall btn-primary" type="submit"
+                              onclick="return confirm('Reset password for {{{{ r.username }}}}?');">
+                              Reset PW
+                            </button>
+                          </form>
+                        </div>
+                        {{% if r.username == user_rep %}}
+                          <div style="font-size:12px; font-weight:850; color: rgba(15,23,42,.60); margin-top:6px;">
+                            (This is you)
+                          </div>
+                        {{% endif %}}
+                      </td>
+                    </tr>
+                  {{% endfor %}}
+                </tbody>
+              </table>
+            </div>
+          </details>
 
           <details class="manageDetails">
             <summary>
@@ -1313,7 +1520,7 @@ HTML_PAGE = f"""
 
           <details class="manageDetails">
             <summary>
-              Admin — store geofence radius (meters)
+              Admin — store geofence radius (legacy; GPS feature removed)
               <span class="chev">▼</span>
             </summary>
             <div class="manageWrap">
@@ -1348,7 +1555,7 @@ HTML_PAGE = f"""
             </div>
             <div class="tableWrap">
               <table>
-                <thead><tr><th>Rep</th><th>Total</th></tr></thead>
+                <thead><tr><th>Rep</th><th>Total</th><th>Today location</th></tr></thead>
                 <tbody>
                   {{% if rep_rows %}}
                     {{% for rep, total, today_total in rep_rows %}}
@@ -1360,10 +1567,13 @@ HTML_PAGE = f"""
                             &nbsp;&nbsp;+{{{{ today_total }}}}
                           </span>
                         </td>
+                        <td style="color: rgba(15,23,42,.75); font-weight: 900;">
+                          {{{{ today_locations.get(rep, '') if today_locations else '' }}}}
+                        </td>
                       </tr>
                     {{% endfor %}}
                   {{% else %}}
-                    <tr><td colspan="2" style="color: rgba(15,23,42,.60); font-weight: 900;">No entries yet</td></tr>
+                    <tr><td colspan="3" style="color: rgba(15,23,42,.60); font-weight: 900;">No entries yet</td></tr>
                   {{% endif %}}
                 </tbody>
               </table>
@@ -1373,7 +1583,7 @@ HTML_PAGE = f"""
           <div class="tableCard">
             <div class="tableTitle">
               <div>Store production</div>
-              <div class="slackIcon" title="Store determined by GPS geofence" aria-label="Slack">{SLACK_SVG}</div>
+              <div class="slackIcon" title="Store is selected manually now" aria-label="Slack">{SLACK_SVG}</div>
             </div>
             <div class="tableWrap">
               <table class="storeTable">
@@ -1396,78 +1606,6 @@ HTML_PAGE = f"""
       </div>
     </div>
   </div>
-
-  <script>
-  (function(){{
-    const storePill = document.getElementById('storePill');
-    const storeText = document.getElementById('storePillText');
-    const gpsStatusText = document.getElementById('gpsStatusText');
-    const addBtn = document.getElementById('addBtn');
-
-    function setPill(mode, text) {{
-      if (!storePill || !storeText) return;
-      storePill.classList.remove('ok','warn');
-      storePill.classList.add(mode);
-      storeText.textContent = text;
-    }}
-
-    function setGpsStatus(text, ok) {{
-      if (!gpsStatusText) return;
-      gpsStatusText.textContent = text;
-      if (addBtn) addBtn.disabled = !ok;
-    }}
-
-    async function pingLocation() {{
-      if (!navigator.geolocation) {{
-        setPill('warn', 'No GPS');
-        setGpsStatus('GPS not supported', false);
-        return;
-      }}
-
-      navigator.geolocation.getCurrentPosition(async (pos) => {{
-        const payload = {{
-          lat: pos.coords.latitude,
-          lon: pos.coords.longitude,
-          accuracy_m: pos.coords.accuracy
-        }};
-        try {{
-          const res = await fetch('/api/location/ping', {{
-            method: 'POST',
-            headers: {{ 'Content-Type': 'application/json' }},
-            body: JSON.stringify(payload)
-          }});
-          const data = await res.json();
-
-          if (data.ok && data.locked) {{
-            setPill('ok', data.store_name);
-            setGpsStatus('Locked ✅', true);
-          }} else {{
-            setPill('warn', data.store_name || 'Not in Costco');
-            setGpsStatus(data.reason || 'Move closer / improve GPS', false);
-          }}
-        }} catch (e) {{
-          setPill('warn', 'Ping failed');
-          setGpsStatus('Network error', false);
-        }}
-      }}, (err) => {{
-        setPill('warn', 'Location blocked');
-        setGpsStatus('Enable location permission', false);
-      }}, {{
-        enableHighAccuracy: true,
-        timeout: 8000,
-        maximumAge: 0
-      }});
-    }}
-
-    // Start ping immediately and re-ping every 2 minutes
-    pingLocation();
-    setInterval(pingLocation, 120000);
-
-    // If admin, don't disable button based on GPS (admin can still use it)
-    const isAdmin = {{ 'true' if admin else 'false' }};
-    if (isAdmin === 'true' && addBtn) addBtn.disabled = false;
-  }})();
-  </script>
 </body>
 </html>
 """
@@ -1483,16 +1621,18 @@ def login():
         username = (request.form.get("username") or "").strip()
         password = request.form.get("password") or ""
 
-        if username not in REPS:
-            error = "Username must be Tristan, Ricky, or Sohaib."
+        rep = get_rep_by_username(username)
+        if not rep or not bool(rep.get("active")):
+            error = "Invalid username or account inactive."
         else:
-            expected = USER_PASSWORDS.get(username, "")
-            if password != expected:
+            if not verify_password(password, rep.get("password_hash") or ""):
                 error = "Incorrect password."
             else:
                 session.clear()
                 session["logged_in"] = True
-                session["rep"] = username
+                session["rep_id"] = int(rep["id"])
+                session["rep_name"] = rep["username"]
+                session["is_admin"] = bool(rep["is_admin"])
                 return redirect(next_url)
 
     return render_template_string(
@@ -1507,64 +1647,6 @@ def login():
 def logout():
     session.clear()
     return redirect(url_for("login"))
-
-
-@app.route("/api/location/ping", methods=["POST"])
-def api_location_ping():
-    gate = require_login()
-    if gate:
-        return gate
-
-    data = request.get_json(silent=True) or {}
-    try:
-        lat = float(data.get("lat"))
-        lon = float(data.get("lon"))
-        accuracy_m = float(data.get("accuracy_m"))
-    except Exception:
-        return jsonify({"ok": False, "locked": False, "reason": "Bad location payload"}), 400
-
-    # If accuracy is too poor, don't lock store
-    if accuracy_m > GPS_MAX_ACCURACY_M:
-        # still store raw location for troubleshooting
-        session["gps_lat"] = lat
-        session["gps_lon"] = lon
-        session["gps_accuracy_m"] = accuracy_m
-        session["gps_ts"] = now_ts()
-        session.pop("store_id", None)
-        session.pop("store_name", None)
-        return jsonify({
-            "ok": True,
-            "locked": False,
-            "store_name": None,
-            "reason": f"Low accuracy ({int(accuracy_m)}m). Try near window."
-        })
-
-    store, dist_m = resolve_store(lat, lon)
-    session["gps_lat"] = lat
-    session["gps_lon"] = lon
-    session["gps_accuracy_m"] = accuracy_m
-    session["gps_ts"] = now_ts()
-
-    if not store:
-        session.pop("store_id", None)
-        session.pop("store_name", None)
-        return jsonify({
-            "ok": True,
-            "locked": False,
-            "store_name": None,
-            "reason": "Not inside a tracked Costco geofence."
-        })
-
-    session["store_id"] = int(store["id"])
-    session["store_name"] = store["name"]
-
-    return jsonify({
-        "ok": True,
-        "locked": True,
-        "store_id": int(store["id"]),
-        "store_name": store["name"],
-        "distance_m": float(dist_m or 0)
-    })
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -1582,8 +1664,14 @@ def index():
     message = request.args.get("msg")
     ok = (request.args.get("ok", "1") == "1")
 
-    user_rep = current_rep()
+    user_rep = current_rep_name()
     admin = is_admin()
+
+    # Today rep location pill
+    my_loc = ""
+    rid = current_rep_id()
+    if rid:
+        my_loc = get_rep_location_for_day(rid, today)
 
     if request.method == "POST":
         action = request.form.get("action", "")
@@ -1600,25 +1688,30 @@ def index():
         if action == "add":
             rep = (request.form.get("rep") or "").strip() or user_rep
             raw = (request.form.get("sales") or "").strip()
+            store_id_raw = (request.form.get("store_id") or "").strip()
             try:
                 qty = int(raw)
                 if qty <= 0:
                     raise ValueError()
 
-                # Admin can add without GPS if you want, but we keep it consistent:
-                if not admin and not gps_is_fresh_and_locked():
-                    return redirect(url_for("index", week=selected_wk_start.isoformat(),
-                                            msg="Enable location + be inside a Costco to add a sale.", ok="0"))
+                store_id = int(store_id_raw) if store_id_raw else None
+                entry_id, slack_ok = add_entry_manual(selected_wk_start, rep, qty, store_id)
 
-                entry_id, slack_ok = add_entry_gps(selected_wk_start, rep, qty)
+                # Store label for message
+                store_label = ""
+                if store_id:
+                    for s in get_stores(active_only=False):
+                        if int(s["id"]) == int(store_id):
+                            store_label = s["name"]
+                            break
 
-                msg = f"Added {qty} sale(s) for {rep} at {get_session_store_label()}."
+                msg = f"Added {qty} sale(s) for {rep}" + (f" at {store_label}." if store_label else ".")
                 if not slack_ok:
                     msg += " (Slack post not sent — check SLACK_BOT_TOKEN / SLACK_CHANNEL_ID.)"
                 return redirect(url_for("index", week=selected_wk_start.isoformat(), msg=msg, ok="1"))
             except Exception:
                 return redirect(url_for("index", week=selected_wk_start.isoformat(),
-                                        msg="Could not add sale. Qty must be >0 and GPS must be locked to a Costco.", ok="0"))
+                                        msg="Could not add sale. Qty must be >0 and you must select a store.", ok="0"))
 
         return redirect(url_for("index", week=selected_wk_start.isoformat(), msg="Unknown action.", ok="0"))
 
@@ -1647,11 +1740,17 @@ def index():
     recent = recent_entries(selected_wk_start, limit=12) if admin else []
     stores = get_stores(active_only=False)
 
+    reps_active = list_reps(active_only=True)
+    reps_all = list_reps(active_only=False) if admin else []
+
+    today_locations = locations_for_day(today)  # {username: location}
+
     return render_template_string(
         HTML_PAGE,
         user_rep=user_rep,
         admin=admin,
-        reps=REPS,
+        reps=reps_active,
+        reps_all=reps_all,
         weekly_sales=weekly_sales,
         goal=goal_qty,
         fill_percentage=fill_percentage,
@@ -1669,7 +1768,9 @@ def index():
         store_rows=store_rows,
         recent=recent,
         version=APP_VERSION,
-        stores=stores
+        stores=stores,
+        today_location=my_loc,
+        today_locations=today_locations
     )
 
 
@@ -1690,6 +1791,123 @@ def admin_goal():
         return redirect(url_for("index", week=week_start.isoformat(), msg="Weekly goal saved.", ok="1"))
     except Exception:
         return redirect(url_for("index", week=week_start.isoformat(), msg="Goal must be a whole number > 0.", ok="0"))
+
+
+@app.route("/admin/set-location", methods=["POST"])
+def admin_set_location():
+    gate = require_login()
+    if gate:
+        return gate
+    if not is_admin():
+        abort(403)
+
+    rep_id = request.form.get("rep_id") or ""
+    loc = request.form.get("location_text") or ""
+    try:
+        rep_id_int = int(rep_id)
+        set_rep_location_for_day(rep_id_int, local_today(), loc, current_rep_id())
+        return redirect(url_for("index", msg="Today location saved.", ok="1"))
+    except Exception:
+        return redirect(url_for("index", msg="Could not save location.", ok="0"))
+
+
+@app.route("/admin/reps/add", methods=["POST"])
+def admin_add_rep():
+    gate = require_login()
+    if gate:
+        return gate
+    if not is_admin():
+        abort(403)
+
+    username = (request.form.get("username") or "").strip()
+    password = (request.form.get("password") or "").strip()
+    is_admin_flag = (request.form.get("is_admin") or "").strip() == "1"
+
+    if not username or not password:
+        return redirect(url_for("index", msg="Username + password required.", ok="0"))
+
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM reps WHERE username=%s;", (username,))
+                if cur.fetchone():
+                    return redirect(url_for("index", msg="That username already exists.", ok="0"))
+                cur.execute("""
+                    INSERT INTO reps (username, password_hash, is_admin, active)
+                    VALUES (%s, %s, %s, TRUE);
+                """, (username, hash_password(password), bool(is_admin_flag)))
+            conn.commit()
+        return redirect(url_for("index", msg=f"Added rep {username}.", ok="1"))
+    except Exception:
+        return redirect(url_for("index", msg="Could not add rep.", ok="0"))
+
+
+@app.route("/admin/reps/toggle", methods=["POST"])
+def admin_toggle_rep():
+    gate = require_login()
+    if gate:
+        return gate
+    if not is_admin():
+        abort(403)
+
+    rep_id = request.form.get("rep_id") or ""
+    set_active = request.form.get("set_active") or ""
+    try:
+        rep_id_int = int(rep_id)
+        active_val = True if str(set_active).strip() == "1" else False
+
+        # Prevent deactivating the last admin
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, username, is_admin FROM reps WHERE id=%s;", (rep_id_int,))
+                r = cur.fetchone()
+                if not r:
+                    return redirect(url_for("index", msg="Rep not found.", ok="0"))
+
+                if bool(r["is_admin"]) and not active_val:
+                    cur.execute("SELECT COUNT(*) AS c FROM reps WHERE is_admin=TRUE AND active=TRUE;")
+                    c = int(cur.fetchone()["c"])
+                    if c <= 1:
+                        return redirect(url_for("index", msg="Cannot deactivate the last active admin.", ok="0"))
+
+                cur.execute("""
+                    UPDATE reps
+                    SET active=%s, updated_at=NOW()
+                    WHERE id=%s;
+                """, (active_val, rep_id_int))
+            conn.commit()
+
+        return redirect(url_for("index", msg="Rep status updated.", ok="1"))
+    except Exception:
+        return redirect(url_for("index", msg="Could not update rep.", ok="0"))
+
+
+@app.route("/admin/reps/reset-password", methods=["POST"])
+def admin_reset_password():
+    gate = require_login()
+    if gate:
+        return gate
+    if not is_admin():
+        abort(403)
+
+    rep_id = request.form.get("rep_id") or ""
+    new_pw = (request.form.get("new_password") or "").strip()
+    if not new_pw:
+        return redirect(url_for("index", msg="New password required.", ok="0"))
+
+    try:
+        rep_id_int = int(rep_id)
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE reps
+                    SET password_hash=%s, updated_at=NOW()
+                    WHERE id=%s;
+                """, (hash_password(new_pw), rep_id_int))
+            conn.commit()
+        return redirect(url_for("index", msg="Password reset.", ok="1"))
+    except Exception:
+        return redirect(url_for("index", msg="Could not reset password.", ok="0"))
 
 
 @app.route("/admin/store-radius", methods=["POST"])
@@ -1736,12 +1954,12 @@ def admin_update():
         sid = int(store_id) if store_id.strip() else None
         update_entry(int(entry_id), int(qty), sid)
         msg = "Saved changes."
-        ok = "1"
+        okv = "1"
     except Exception:
         msg = "Could not save. Qty must be > 0 and Store must be valid."
-        ok = "0"
+        okv = "0"
 
-    return redirect(url_for("index", week=week_start.isoformat(), msg=msg, ok=ok))
+    return redirect(url_for("index", week=week_start.isoformat(), msg=msg, ok=okv))
 
 
 @app.route("/admin/delete", methods=["POST"])
@@ -1759,12 +1977,12 @@ def admin_delete():
     try:
         delete_entry(int(entry_id))
         msg = f"Deleted entry #{entry_id}."
-        ok = "1"
+        okv = "1"
     except Exception:
         msg = "Could not delete that entry."
-        ok = "0"
+        okv = "0"
 
-    return redirect(url_for("index", week=week_start.isoformat(), msg=msg, ok=ok))
+    return redirect(url_for("index", week=week_start.isoformat(), msg=msg, ok=okv))
 
 
 @app.route("/export.csv")
@@ -1865,14 +2083,16 @@ def slack_events():
         mark_slack_event_processed(event_id)
         return Response("ok", status=200)
 
-    # We do NOT create sales from Slack messages anymore (fool-proof method uses GPS+app posting)
     mark_slack_event_processed(event_id)
     return Response("ok", status=200)
 
 
 @app.route("/db-status")
 def db_status():
-    if not (session.get("logged_in") and session.get("rep") == ADMIN_REP):
+    gate = require_login()
+    if gate:
+        return gate
+    if not is_admin():
         abort(403)
 
     with db_conn() as conn:
@@ -1882,15 +2102,17 @@ def db_status():
             count = int(row["c"])
             cur.execute("SELECT current_database() AS db, current_user AS u;")
             row2 = cur.fetchone()
+            cur.execute("SELECT COUNT(*) AS c FROM reps;")
+            reps_count = int(cur.fetchone()["c"])
 
     return {
         "ok": True,
         "database": row2["db"],
         "user": row2["u"],
         "rows_in_sales_entries": int(count),
+        "rows_in_reps": reps_count,
         "central_today": local_today().isoformat(),
-        "gps_max_age_seconds": GPS_MAX_AGE_SECONDS,
-        "gps_max_accuracy_m": GPS_MAX_ACCURACY_M,
+        "version": APP_VERSION,
     }
 
 
@@ -1898,4 +2120,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     init_db()
     app.run(host="0.0.0.0", port=port)
-
